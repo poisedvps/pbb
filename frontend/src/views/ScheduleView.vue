@@ -8,15 +8,16 @@
     </template>
 
     <div class="toolbar">
-      <el-button @click="prevMonth">‹</el-button>
+      <!-- 整月写入与保存进行到时不许切月：确认文案说的是哪个月，请求就只能打给哪个月 -->
+      <el-button :disabled="monthLocked || saving" @click="prevMonth">‹</el-button>
       <b class="month">{{ monthText }}</b>
-      <el-button @click="nextMonth">›</el-button>
+      <el-button :disabled="monthLocked || saving" @click="nextMonth">›</el-button>
       <el-input v-model="keyword" class="kw" placeholder="搜索姓名/工号" clearable />
       <div class="sp"></div>
-      <el-button v-if="auth.isAdmin" :loading="working" @click="generate">⚡ 按规则生成</el-button>
+      <el-button v-if="auth.isAdmin" :loading="working" :disabled="monthLocked || saving || loading" @click="generate">⚡ 按规则生成</el-button>
       <el-button @click="print">打印</el-button>
       <el-button v-if="auth.isAdmin" class="screen-btn" @click="openScreen">🖥 大屏展示</el-button>
-      <el-button v-if="auth.isAdmin" type="primary" :loading="working" @click="publish">发布排班</el-button>
+      <el-button v-if="auth.isAdmin" type="primary" :loading="working" :disabled="monthLocked || saving || loading" @click="publish">发布排班</el-button>
     </div>
 
     <!-- 规则说明只给科长看，成员不需要关心默认规则怎么来的 -->
@@ -127,15 +128,16 @@ const working = ref(false)
 // 快速连点 ‹ › 会并发发出多个 getSchedule，慢的旧响应不能盖掉新的月份
 let reqSeq = 0
 
-const reload = async () => {
+const reload = async (target = ym.value) => {
   const seq = ++reqSeq
   loading.value = true
   try {
-    const resp = await getSchedule(ym.value)
-    if (seq === reqSeq) data.value = resp
+    const resp = await getSchedule(target)
+    // 慢的旧响应既不能盖掉新月份，也不能盖掉科长已经翻过去的视图
+    if (seq === reqSeq && target === ym.value) data.value = resp
   } catch {
     // 失败提示由 http 拦截器统一弹出；旧请求失败不动当前数据
-    if (seq === reqSeq) data.value = null
+    if (seq === reqSeq && target === ym.value) data.value = null
   } finally {
     if (seq === reqSeq) loading.value = false
   }
@@ -151,6 +153,8 @@ onMounted(async () => {
 })
 
 const shiftMonth = (delta) => {
+  // 整月写入或保存还挂在半途时切月，会让在途请求的目标月份和屏幕上的月份对不上
+  if (monthLocked.value || saving.value) return
   const [y, m] = ym.value.split('-').map(Number)
   const date = new Date(y, m - 1 + delta, 1)
   ym.value = `${date.getFullYear()}-${pad(date.getMonth() + 1)}`
@@ -163,10 +167,14 @@ const nextMonth = () => shiftMonth(1)
 const print = () => window.print()
 const openScreen = () => window.open('/screen', '_blank')
 
-const monthText = computed(() => {
-  const [y, m] = ym.value.split('-').map(Number)
+const labelOf = (v) => {
+  const [y, m] = v.split('-').map(Number)
   return `${y}年${m}月`
-})
+}
+const monthText = computed(() => labelOf(ym.value))
+// 屏幕上这份表到底是哪个月以 data 为准：切月请求还在路上时它仍是上一份成功数据，
+// 科长此刻看到、能点到的格子也都属于这个月，写入必须打给这个月而不是 ym
+const viewYm = () => data.value?.yearMonth || ''
 
 const statusTag = computed(() => {
   if (data.value?.status === 'PUBLISHED') return { type: 'success', text: `已发布 v${data.value.version}` }
@@ -219,40 +227,50 @@ const confirmBox = (message, title) =>
     .then(() => true)
     .catch(() => false)
 
-const generate = async () => {
-  if (working.value) return
-  const ok = await confirmBox(`将按规则生成 ${monthText.value} 排班，手工调整过的格子不会被覆盖。`, '按规则生成')
-  if (!ok) return
-  working.value = true
-  try {
-    const resp = await generateSchedule(ym.value)
-    ElMessage.success(`已生成 ${resp.generated} 格，跳过手工 ${resp.skippedManual} 格`)
-    await reload()
-  } catch {
-    // 失败提示由 http 拦截器统一弹出
-  } finally {
-    working.value = false
-  }
-}
+// 整月写入（确认框 + 请求 + 刷新）全程独占：确认文案里的月份与实际请求的月份必须始终是同一个
+const monthLocked = ref(false)
 
-const publish = async () => {
-  if (working.value) return
-  const ok = await confirmBox(`确认发布 ${monthText.value} 排班？发布后全科成员与大屏可见。`, '发布排班')
-  if (!ok) return
-  working.value = true
+const runOnMonth = async (action, message, title, done) => {
+  // 保存没过、上一份月数据没落定之前不发起整月写入，免得两条写入交错在同一张表上
+  if (working.value || monthLocked.value || saving.value || loading.value) return
+  const target = viewYm()
+  if (!target) return
+  monthLocked.value = true
   try {
-    const resp = await publishSchedule(ym.value)
-    ElMessage.success(`已发布 v${resp.version}`)
-    await reload()
+    const ok = await confirmBox(message(labelOf(target)), title)
+    if (!ok) return
+    working.value = true
+    const resp = await action(target)
+    ElMessage.success(done(resp))
+    // 只在还停在这一个月时刷新视图；换月了就把屏幕留给那边的请求
+    if (viewYm() === target && ym.value === target) await reload(target)
   } catch {
     // 失败提示由 http 拦截器统一弹出（如 1504 本月还没有草稿）
   } finally {
     working.value = false
+    monthLocked.value = false
   }
 }
 
+const generate = () =>
+  runOnMonth(
+    generateSchedule,
+    (label) => `将按规则生成 ${label} 排班，手工调整过的格子不会被覆盖。`,
+    '按规则生成',
+    (resp) => `已生成 ${resp.generated} 格，跳过手工 ${resp.skippedManual} 格`
+  )
+
+const publish = () =>
+  runOnMonth(
+    publishSchedule,
+    (label) => `确认发布 ${label} 排班？发布后全科成员与大屏可见。`,
+    '发布排班',
+    (resp) => `已发布 v${resp.version}`
+  )
+
 const editorVisible = ref(false)
 const saving = ref(false)
+const editYm = ref('')
 const editRow = ref(null)
 const editDate = ref('')
 const pick = ref(DEFAULT_PICK)
@@ -265,8 +283,10 @@ const editorTitle = computed(() => {
 })
 
 const openEditor = (row, date) => {
-  if (!auth.isAdmin) return
+  // 保存没落地前不让再开一格：否则上一条的响应会写进这一格，还会把新弹窗关掉
+  if (!auth.isAdmin || saving.value || monthLocked.value) return
   const cell = cellOf(row, date)
+  editYm.value = viewYm()
   editRow.value = row
   editDate.value = date
   // 没排过班（整月还没生成过）时没有当前值，落在「恢复规则默认」上
@@ -277,20 +297,36 @@ const openEditor = (row, date) => {
 
 const saveEntry = async () => {
   if (saving.value) return
+  // 发请求前把这条记录的身份与表单值全部定死：响应回来时科长可能已经关掉弹窗、翻到别的月份
+  const target = {
+    ym: editYm.value,
+    staffId: editRow.value?.staffId,
+    workDate: editDate.value,
+    shiftCode: pick.value === DEFAULT_PICK ? null : pick.value,
+    remark: remark.value.trim() || null
+  }
+  if (!target.ym || !target.staffId) return
   saving.value = true
   try {
-    const cell = await updateEntry(ym.value, {
-      staffId: editRow.value.staffId,
-      workDate: editDate.value,
-      shiftCode: pick.value === DEFAULT_PICK ? null : pick.value,
-      remark: remark.value.trim() || null
+    const cell = await updateEntry(target.ym, {
+      staffId: target.staffId,
+      workDate: target.workDate,
+      shiftCode: target.shiftCode,
+      remark: target.remark
     })
+    // 屏幕已经翻到别的月份：这份 CellVO 属于过去的视图，一格一格都不许写进当前表，
+    // 更不能把新月错误标成「草稿 · 未发布」
+    if (viewYm() !== target.ym) return
+    const row = rows.value.find((r) => r.staffId === target.staffId)
     // 只换这一格：整表重载会把科长的滚动位置甩回左上角
-    editRow.value.cells = { ...(editRow.value.cells || {}), [editDate.value]: cell }
+    if (row) row.cells = { ...(row.cells || {}), [target.workDate]: cell }
     // 任何写入都让草稿回到未发布状态，后端与前端口径一致
     if (data.value) data.value.status = 'DRAFT'
     ElMessage.success('已保存')
-    editorVisible.value = false
+    // 弹窗已经换成别的格子（或已被科长自己关掉），别替它关
+    if (editYm.value === target.ym && editRow.value?.staffId === target.staffId && editDate.value === target.workDate) {
+      editorVisible.value = false
+    }
   } catch {
     // 失败提示由 http 拦截器统一弹出（如 1502 班次已停用），弹窗留着改
   } finally {
