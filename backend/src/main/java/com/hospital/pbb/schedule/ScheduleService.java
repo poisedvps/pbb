@@ -3,6 +3,7 @@ package com.hospital.pbb.schedule;
 import com.hospital.pbb.common.BizException;
 import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
+import com.hospital.pbb.schedule.dto.CellChange;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
 import com.hospital.pbb.schedule.dto.PublishResultVO;
@@ -217,6 +218,55 @@ public class ScheduleService {
         opLog.record(OpAction.PUBLISH_SCHEDULE, yearMonth,
                 "版本 v" + newVersion + "，共" + entries.size() + "格");
         return new PublishResultVO(newVersion, entries.size());
+    }
+
+    /**
+     * 把调班结果同时写入草稿和已发布快照（设计 §5.3、任务单 M3-01）。
+     *
+     * <p>调班是"科长已经批准的事实"，不是又一次手工改格子：月份状态和 version 一律不动，
+     * 也不走 {@code markDraft}——否则审批通过一条申请会把整月打回草稿，成员看到的还是上一次发布的班，
+     * 科长却以为已经变了。已发布快照里已有这个格子时才跟着改，没有就只写草稿，
+     * 补插一条快照等于替科长发布了他没发布过的内容。</p>
+     *
+     * <p>锁按涉及的月份<b>去重后升序</b>逐个取：跨月调班（10-31 和 11-01 换）如果两个事务逆序取锁，
+     * 会互相死锁。取完锁才写库，锁随事务释放，所以整个方法必须待在同一个事务里。</p>
+     *
+     * @param changes    调班结果，每条是"某人某天的班改成什么"
+     * @param target     写入格子 remark 和操作日志 target，如 {@code 调班 TB-0003}
+     * @param operatorId 操作人 id，写入格子的 {@code updated_by}
+     */
+    @Transactional
+    public void applyChanges(List<CellChange> changes, String target, Long operatorId) {
+        List<YearMonth> months = changes.stream()
+                .map(change -> YearMonth.from(change.workDate()))
+                .distinct()
+                .sorted()
+                .toList();
+        for (YearMonth ym : months) {
+            monthRepo.lockMonth(ScheduleMonths.lockKey(ym));
+        }
+
+        OffsetDateTime now = OffsetDateTime.now(clock);
+        for (CellChange change : changes) {
+            ScheduleEntry entry = entryRepo.findByStaffIdAndWorkDate(change.staffId(), change.workDate())
+                    .orElseGet(() -> newEntry(change.staffId(), change.workDate()));
+            entry.setShiftCode(change.shiftCode());
+            // 调班落地按手工格处理：重排规则时不能被规则默认值冲掉
+            entry.setManual(true);
+            entry.setRemark(target);
+            entry.setUpdatedBy(operatorId);
+            entry.setUpdatedAt(now);
+            entryRepo.save(entry);
+
+            publishedRepo.findByStaffIdAndWorkDate(change.staffId(), change.workDate())
+                    .ifPresent(snapshot -> {
+                        snapshot.setShiftCode(change.shiftCode());
+                        snapshot.setRemark(target);
+                        publishedRepo.save(snapshot);
+                    });
+        }
+
+        opLog.record(OpAction.APPLY_SWAP_TO_SCHEDULE, target, "共" + changes.size() + "格");
     }
 
     /** 快照只带走会展示的那几列，{@code is_manual}、{@code updated_by} 这些管理字段留在草稿表里 */

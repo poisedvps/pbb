@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * 排班月视图查询（设计 §5、§5.2）。
@@ -149,6 +150,21 @@ public class ScheduleQueryService {
         ScheduleMonth month = monthRepo.findById(yearMonth).orElse(null);
         return new MineVO(yearMonth, month != null && month.getVersion() > 0, days, counts, workHours,
                 nextShift(staffId, shifts));
+    }
+
+    /**
+     * 某人某天的已发布班次代码（任务单 M3-01，给调班模块做只读校验）。
+     *
+     * <p>调班只能换“成员已经看到的那个班”，所以取的是已发布快照而不是草稿；
+     * 库里 {@code (staff_id, work_date)} 唯一，最多一条。没排到班（或还没发布）时返回空。</p>
+     *
+     * @param staffId 人员 id
+     * @param date    日期
+     * @return 已发布的班次代号，无已发布记录时 {@link Optional#empty()}
+     */
+    @Transactional(readOnly = true)
+    public Optional<String> publishedShift(Long staffId, LocalDate date) {
+        return publishedRepo.findByStaffIdAndWorkDate(staffId, date).map(SchedulePublishedEntry::getShiftCode);
     }
 
     /**
