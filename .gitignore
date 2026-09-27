@@ -1,0 +1,14 @@
+# 密钥与部署配置
+.env
+scripts/deploy.env
+
+# 构建产物
+node_modules/
+frontend/dist/
+backend/target/
+
+# IDE / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store

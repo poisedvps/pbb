@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>医院信息科排班表 · 前端原型 v0.2</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#f4f6f9;--card:#fff;--line:#e3e7ee;--text:#1f2937;--muted:#6b7280;--primary:#1677c8;--primary-weak:#e8f2fb;
+    --danger:#d64545;
+    --s-day:#dbeafe;--s-day-t:#1d4ed8;--s-night:#ede9fe;--s-night-t:#6d28d9;--s-duty:#fee2e2;--s-duty-t:#b91c1c;
+    --s-standby:#fef3c7;--s-standby-t:#92400e;--s-off:#f3f4f6;--s-off-t:#6b7280;--s-leave:#dcfce7;--s-leave-t:#166534;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--text);background:var(--bg)}
+  .proto-bar{background:#111827;color:#fbbf24;font-size:12px;padding:4px 16px;text-align:center}
+  header{height:52px;background:var(--primary);color:#fff;display:flex;align-items:center;padding:0 20px;gap:16px}
+  header .logo{font-weight:600;font-size:16px}
+  header .sp{flex:1}
+  header .role{background:rgba(255,255,255,.15);border:0;color:#fff;border-radius:4px;padding:4px 8px}
+  header .role option{color:#000}
+  .layout{display:flex;min-height:calc(100vh - 76px)}
+  nav{width:190px;background:#fff;border-right:1px solid var(--line);padding:12px 0}
+  nav a{display:flex;align-items:center;gap:8px;padding:10px 20px;color:var(--text);text-decoration:none;cursor:pointer}
+  nav a:hover{background:var(--bg)}
+  nav a.active{background:var(--primary-weak);color:var(--primary);border-right:3px solid var(--primary);font-weight:600}
+  nav .grp{font-size:12px;color:var(--muted);padding:14px 20px 4px}
+  nav .hide{display:none!important}
+  main{flex:1;padding:20px;overflow:auto}
+  .page{display:none}.page.active{display:block}
+  h2{margin:0 0 14px;font-size:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px}
+  .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px}
+  .toolbar .sp{flex:1}
+  button{border:1px solid var(--line);background:#fff;border-radius:5px;padding:6px 12px;cursor:pointer;font-size:13px;color:var(--text)}
+  button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+  button.screen{background:#0f172a;border-color:#0f172a;color:#fff}
+  button.link{border:0;background:none;color:var(--primary);padding:2px 4px}
+  select,input,textarea{border:1px solid var(--line);border-radius:5px;padding:6px 8px;font-size:13px;font-family:inherit}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+  .seg button{border:0;border-radius:0;border-right:1px solid var(--line)}
+  .seg button:last-child{border-right:0}
+  .seg button.on{background:var(--primary-weak);color:var(--primary);font-weight:600}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+  .tag.draft,.tag.pending{background:#fef3c7;color:#92400e}
+  .tag.pub,.tag.approved{background:#dcfce7;color:#166534}
+  .tag.rejected,.tag.hol{background:#fee2e2;color:#b91c1c}
+  .tag.work{background:#dbeafe;color:#1d4ed8}
+  table{border-collapse:collapse;width:100%}
+  th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}
+  th{background:#f9fafb;font-weight:600;font-size:13px}
+  /* 排班网格 */
+  .grid-wrap{overflow:auto;max-height:calc(100vh - 270px);border:1px solid var(--line);border-radius:6px}
+  table.grid{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%}
+  table.grid th,table.grid td{border:0;border-right:1px solid var(--line);border-bottom:1px solid var(--line);text-align:center;padding:0;height:38px}
+  table.grid thead th{position:sticky;top:0;z-index:2;background:#f9fafb;min-width:46px;padding:4px 2px;font-weight:500;line-height:1.2}
+  table.grid thead th small{display:block;color:var(--muted);font-size:11px}
+  table.grid th.we{background:#fff7ed}table.grid th.hol{background:#fee2e2}table.grid th.wk{background:#dbeafe}
+  table.grid .name{position:sticky;left:0;z-index:1;background:#fff;text-align:left;padding:0 10px;min-width:110px;white-space:nowrap}
+  table.grid thead th.name{z-index:3}
+  table.grid td.cell{cursor:pointer;min-width:46px}
+  table.grid td.cell:hover{outline:2px solid var(--primary);outline-offset:-2px}
+  table.grid td.cell.manual{box-shadow:inset 0 -3px 0 #f59e0b}
+  table.grid tr.cov td{background:#f9fafb;font-size:12px;height:30px}
+  table.grid td.me-row{background:#fffbeb}
+  .sh{display:inline-block;min-width:30px;padding:2px 4px;border-radius:4px;font-size:12px;font-weight:600}
+  .sh-D{background:var(--s-day);color:var(--s-day-t)}.sh-N{background:var(--s-night);color:var(--s-night-t)}
+  .sh-Z{background:var(--s-duty);color:var(--s-duty-t)}.sh-B{background:var(--s-standby);color:var(--s-standby-t)}
+  .sh-X{background:var(--s-off);color:var(--s-off-t)}.sh-L{background:var(--s-leave);color:var(--s-leave-t)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:4px}
+  .pop{position:fixed;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);padding:10px;z-index:50;display:none;width:220px}
+  .pop .t{font-size:12px;color:var(--muted);margin-bottom:6px}
+  .pop .opts{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+  .pop .opts .sh{cursor:pointer;text-align:center;padding:6px 0}
+  .pop textarea{width:100%;margin-top:8px;height:40px}
+  .info{border-left:3px solid var(--primary);background:var(--primary-weak);padding:8px 12px;border-radius:4px;font-size:13px;margin-bottom:12px}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+  .kpi{background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px}
+  .kpi .v{font-size:24px;font-weight:600}.kpi .l{color:var(--muted);font-size:12px}
+  .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+  .cal .h{text-align:center;color:var(--muted);font-size:12px}
+  .cal .d{background:#fff;border:1px solid var(--line);border-radius:6px;min-height:78px;padding:6px}
+  .cal .d .n{font-size:12px;color:var(--muted)}
+  .cal .d.today{border-color:var(--primary);box-shadow:0 0 0 1px var(--primary)}
+  .cal .d.empty{background:transparent;border:0}
+  .cal .d.hol{background:#fff5f5}
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:60}
+  .modal{background:#fff;border-radius:8px;width:480px;padding:20px}
+  .modal .row{display:flex;align-items:center;margin-bottom:12px}
+  .modal .row label{width:90px;color:var(--muted)}
+  .modal .row > :not(label){flex:1}
+  .modal .foot{margin-top:16px;display:flex;gap:8px;justify-content:flex-end}
+  .note{font-size:12px;color:var(--muted)}
+  .login{max-width:360px;margin:80px auto;background:#fff;border:1px solid var(--line);border-radius:10px;padding:28px}
+  .login input{width:100%;margin-bottom:12px;padding:9px}
+  .login button{width:100%;padding:9px}
+  .flow{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted)}
+  .flow b{color:var(--text);font-weight:500;background:#f3f4f6;padding:2px 8px;border-radius:10px}
+  .drag{cursor:grab;color:var(--muted)}
+
+  /* ========== 大屏模式 ========== */
+  #bigscreen{display:none;position:fixed;inset:0;z-index:100;background:#0b1220;color:#e5e7eb;padding:2.2vh 2.2vw;flex-direction:column;font-size:1.6vh}
+  #bigscreen.on{display:flex}
+  .bs-head{display:flex;align-items:flex-end;gap:2vw;margin-bottom:2vh}
+  .bs-title{font-size:4.2vh;font-weight:700;letter-spacing:.1em;color:#fff}
+  .bs-sub{font-size:2.2vh;color:#93c5fd}
+  .bs-head .sp{flex:1}
+  .bs-clock{text-align:right}
+  .bs-clock .t{font-size:5vh;font-weight:700;font-variant-numeric:tabular-nums;color:#fff;line-height:1}
+  .bs-clock .d{font-size:2vh;color:#9ca3af}
+  .bs-today{display:grid;grid-template-columns:repeat(4,1fr);gap:1.2vw;margin-bottom:2vh}
+  .bs-today .c{background:#111a2e;border:1px solid #1f2a44;border-radius:1vh;padding:1.4vh 1.2vw}
+  .bs-today .c .l{font-size:1.8vh;color:#9ca3af}
+  .bs-today .c .v{font-size:2.8vh;font-weight:600;color:#fff;margin-top:.4vh}
+  .bs-grid{flex:1;overflow:hidden;border-radius:1vh;border:1px solid #1f2a44}
+  .bs-grid table{width:100%;height:100%;border-collapse:collapse;table-layout:fixed}
+  .bs-grid th,.bs-grid td{border:1px solid #1f2a44;text-align:center;padding:0}
+  .bs-grid th{background:#111a2e;font-size:2.2vh;font-weight:600;color:#cbd5e1;height:6.5vh;line-height:1.2}
+  .bs-grid th small{display:block;font-size:1.6vh;color:#64748b;font-weight:400}
+  .bs-grid th.today{background:#1e3a8a;color:#fff}.bs-grid th.today small{color:#bfdbfe}
+  .bs-grid th.hol small{color:#f87171}
+  .bs-grid td{font-size:2.3vh}
+  .bs-grid td.nm{text-align:left;padding-left:1.2vw;font-weight:600;color:#fff;width:11vw}
+  .bs-grid td.today{background:rgba(30,58,138,.35)}
+  .bs-grid .sh{font-size:2.1vh;padding:.5vh .8vw;border-radius:.6vh;min-width:5vw}
+  .bs-grid .sh-X{background:transparent;color:#475569}
+  .bs-foot{display:flex;justify-content:space-between;margin-top:1.4vh;color:#64748b;font-size:1.6vh}
+  .bs-exit{position:absolute;top:1vh;right:1vw;opacity:0;transition:.2s;background:#1f2a44;color:#fff;border:0}
+  #bigscreen:hover .bs-exit{opacity:1}
+</style>
+</head>
+<body>
+<div class="proto-bar">⚠ 前端交互原型 v0.2（静态演示数据，姓名均为虚构，不连接任何数据库）· 右上角可切换角色 · 点“大屏展示”查看全屏效果</div>
+<header>
+  <div class="logo">🗓 信息科排班系统</div>
+  <div class="sp"></div>
+  <span>角色：</span>
+  <select class="role" id="role">
+    <option value="admin">科长（管理员）</option>
+    <option value="member">普通成员（王磊）</option>
+  </select>
+  <span id="who">科长 · 李主任</span>
+  <button class="role" onclick="go('password')">修改密码</button>
+  <button class="role" onclick="go('login')">退出</button>
+</header>
+
+<div class="layout">
+<nav id="nav">
+  <div class="grp">排班</div>
+  <a data-p="schedule" class="active">📅 排班表</a>
+  <a data-p="mine">👤 我的排班</a>
+  <a data-p="swap">🔁 调班申请 <span class="tag pending">2</span></a>
+  <a data-p="stats">📊 统计报表</a>
+  <div class="grp adm">基础设置</div>
+  <a data-p="staff" class="adm">👥 人员管理</a>
+  <a data-p="holiday" class="adm">🎌 节假日</a>
+  <a data-p="shifts" class="adm">⏱ 班次设置</a>
+  <div class="grp adm">系统</div>
+  <a data-p="users" class="adm">🔐 账号管理</a>
+  <a data-p="logs" class="adm">📜 操作日志</a>
+</nav>
+
+<main>
+<!-- ============ 排班表 ============ -->
+<section class="page active" id="p-schedule">
+  <h2>排班表 <span class="tag draft" id="pubState">草稿 · 未发布</span></h2>
+  <div class="card">
+    <div class="toolbar">
+      <button onclick="shiftMonth(-1)">‹</button>
+      <b id="monthLabel" style="min-width:90px;text-align:center"></b>
+      <button onclick="shiftMonth(1)">›</button>
+      <div class="seg" id="viewSeg">
+        <button data-v="month" class="on">月视图</button><button data-v="week">周视图</button>
+      </div>
+      <input placeholder="搜索姓名/工号" id="kw" style="width:130px">
+      <div class="sp"></div>
+      <span class="edit-only"><button onclick="genDefault(true)">⚡ 按规则生成</button></span>
+      <button onclick="alert('导出 Excel：导出当前月份排班 .xlsx')">导出 Excel</button>
+      <button onclick="window.print()">打印</button>
+      <button class="screen" onclick="openScreen()">🖥 大屏展示</button>
+      <span class="edit-only"><button class="primary" onclick="publish()">发布排班</button></span>
+    </div>
+    <div class="info edit-only-block">
+      <b>排班规则：</b>工作日（周一至周五）默认<b>白班</b>，双休日与节假日默认<b>休息</b>；“调休上班”日按工作日处理。
+      夜班 / 值班 / 备班 / 请假在此基础上<b>手工调整</b>（手工改过的格子下方显示橙色线）。
+    </div>
+    <div class="grid-wrap"><table class="grid" id="grid"></table></div>
+    <div class="toolbar" style="margin-top:10px">
+      <div class="legend" id="legend"></div>
+      <div class="sp"></div>
+      <span class="note edit-only">点击单元格修改班次；底部行 = 每日在岗人数</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 我的排班 ============ -->
+<section class="page" id="p-mine">
+  <h2>我的排班</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="v" id="k1">-</div><div class="l">本月白班</div></div>
+    <div class="kpi"><div class="v" id="k2">-</div><div class="l">本月夜班 / 值班</div></div>
+    <div class="kpi"><div class="v" id="k3">-</div><div class="l">本月工时（小时）</div></div>
+    <div class="kpi"><div class="v" id="k4">-</div><div class="l">下一个班次</div></div>
+  </div>
+  <div class="card">
+    <div class="toolbar"><b id="mineLabel"></b><div class="sp"></div>
+      <button class="primary" onclick="openSwap()">申请调班</button></div>
+    <div class="cal" id="cal"></div>
+  </div>
+</section>
+
+<!-- ============ 调班申请 ============ -->
+<section class="page" id="p-swap">
+  <h2>调班申请</h2>
+  <div class="card">
+    <div class="toolbar">
+      <div class="seg"><button class="on">全部</button><button class="adm-inline">待我审批</button><button>我发起的</button></div>
+      <div class="sp"></div>
+      <div class="flow">流程：<b>申请人发起</b>→<b>对方确认</b>→<b>科长审批</b>→<b>自动更新排班</b></div>
+      <button class="primary" onclick="openSwap()">＋ 新建申请</button>
+    </div>
+    <table>
+      <thead><tr><th>编号</th><th>类型</th><th>申请人</th><th>原班次</th><th>对方 / 目标</th><th>原因</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="swapBody"></tbody>
+    </table>
+    <p class="note">系统内提示，不发送短信/企业微信通知。</p>
+  </div>
+</section>
+
+<!-- ============ 统计 ============ -->
+<section class="page" id="p-stats">
+  <h2>统计报表</h2>
+  <div class="card">
+    <div class="toolbar">
+      <select><option>2026年10月</option><option>2026年第四季度</option><option>2026年全年</option></select>
+      <div class="sp"></div><button onclick="alert('导出统计 Excel')">导出 Excel</button>
+    </div>
+    <table>
+      <thead><tr><th>姓名</th><th>白班</th><th>夜班</th><th>值班</th><th>备班</th><th>请假</th><th>节假日/周末上班</th><th>总工时</th></tr></thead>
+      <tbody id="statBody"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 人员 ============ -->
+<section class="page" id="p-staff">
+  <h2>人员管理</h2>
+  <div class="card">
+    <div class="toolbar">
+      <span class="note">不分组，人数不限。拖动 ☰ 调整在排班表 / 大屏中的显示顺序。</span>
+      <div class="sp"></div>
+      <button onclick="alert('从 Excel 批量导入人员')">批量导入</button>
+      <button class="primary" onclick="openModal('staffModal')">＋ 新增人员</button>
+    </div>
+    <table>
+      <thead><tr><th style="width:40px">排序</th><th>工号</th><th>姓名</th><th>岗位（选填）</th><th>联系电话</th><th>参与排班</th><th>登录账号</th><th>操作</th></tr></thead>
+      <tbody id="staffBody"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 节假日 ============ -->
+<section class="page" id="p-holiday">
+  <h2>节假日设置</h2>
+  <div class="card">
+    <div class="toolbar">
+      <select id="holYear"><option>2026</option><option>2027</option></select>
+      <span class="note">每年初由科长录入当年法定节假日与调休上班日（依据国务院放假安排）。</span>
+      <div class="sp"></div>
+      <button onclick="alert('复制上一年节假日名称作为模板，只需修改日期')">从上一年复制</button>
+      <button class="primary" onclick="openModal('holModal')">＋ 添加节假日</button>
+    </div>
+    <table>
+      <thead><tr><th>名称</th><th>日期范围</th><th>天数</th><th>类型</th><th>说明</th><th>操作</th></tr></thead>
+      <tbody id="holBody"></tbody>
+    </table>
+    <p class="note">类型说明：<span class="tag hol">放假</span> 当日默认休息；<span class="tag work">调休上班</span> 周末但按工作日排白班。修改节假日后，未发布月份可点“按规则生成”刷新。</p>
+  </div>
+</section>
+
+<!-- ============ 班次 ============ -->
+<section class="page" id="p-shifts">
+  <h2>班次设置</h2>
+  <div class="card">
+    <div class="toolbar"><div class="sp"></div><button class="primary" onclick="alert('新增班次弹窗')">＋ 新增班次</button></div>
+    <table>
+      <thead><tr><th>简称</th><th>名称</th><th>时间</th><th>工时</th><th>跨天</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="shiftBody"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 账号 ============ -->
+<section class="page" id="p-users">
+  <h2>账号管理</h2>
+  <div class="card">
+    <div class="toolbar"><span class="note">系统自带账号密码登录。新增人员时自动创建账号（用户名 = 工号），初始密码首次登录强制修改。</span><div class="sp"></div></div>
+    <table>
+      <thead><tr><th>用户名</th><th>姓名</th><th>角色</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead>
+      <tbody id="userBody"></tbody>
+    </table>
+    <h3 style="font-size:15px;margin:18px 0 8px">角色权限</h3>
+    <table>
+      <thead><tr><th>角色</th><th>查看排班</th><th>编辑排班</th><th>发布</th><th>调班</th><th>基础设置 / 账号</th></tr></thead>
+      <tbody>
+        <tr><td>科长（管理员）</td><td>全部（含草稿）</td><td>✔</td><td>✔</td><td>发起 + 审批</td><td>✔</td></tr>
+        <tr><td>普通成员</td><td>仅已发布</td><td>✘</td><td>✘</td><td>发起 + 确认</td><td>✘</td></tr>
+        <tr><td>大屏账号</td><td>仅已发布，只读大屏页</td><td>✘</td><td>✘</td><td>✘</td><td>✘</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 日志 ============ -->
+<section class="page" id="p-logs">
+  <h2>操作日志</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>详情</th></tr></thead>
+      <tbody>
+        <tr><td>2026-09-26 16:20</td><td>李主任</td><td>发布排班</td><td>2026年9月</td><td>版本 v3</td></tr>
+        <tr><td>2026-09-26 15:02</td><td>李主任</td><td>修改班次</td><td>王磊 09-28</td><td>白班 → 夜班</td></tr>
+        <tr><td>2026-09-25 10:11</td><td>李主任</td><td>审批调班</td><td>#TB-0012</td><td>通过</td></tr>
+        <tr><td>2026-01-05 09:30</td><td>李主任</td><td>添加节假日</td><td>2026 春节</td><td>02-15 ~ 02-23</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 修改密码 ============ -->
+<section class="page" id="p-password">
+  <h2>修改密码</h2>
+  <div class="card" style="max-width:420px">
+    <p><input type="password" placeholder="原密码" style="width:100%"></p>
+    <p><input type="password" placeholder="新密码（至少 8 位，含字母和数字）" style="width:100%"></p>
+    <p><input type="password" placeholder="确认新密码" style="width:100%"></p>
+    <button class="primary" onclick="alert('密码已修改');go('schedule')">保存</button>
+  </div>
+</section>
+
+<!-- ============ 登录 ============ -->
+<section class="page" id="p-login">
+  <div class="login">
+    <h2 style="text-align:center">信息科排班系统</h2>
+    <input placeholder="用户名（工号）"><input placeholder="密码" type="password">
+    <button class="primary" onclick="go('schedule')">登 录</button>
+    <p class="note" style="text-align:center">连续输错 5 次锁定 15 分钟 · 仅限医院内网访问</p>
+  </div>
+</section>
+</main>
+</div>
+
+<!-- ============ 大屏 ============ -->
+<div id="bigscreen">
+  <button class="bs-exit" onclick="closeScreen()">退出大屏 (Esc)</button>
+  <div class="bs-head">
+    <div><div class="bs-title">信息科排班表</div><div class="bs-sub" id="bsSub"></div></div>
+    <div class="sp"></div>
+    <div class="bs-clock"><div class="t" id="bsTime"></div><div class="d" id="bsDate"></div></div>
+  </div>
+  <div class="bs-today" id="bsToday"></div>
+  <div class="bs-grid"><table id="bsGrid"></table></div>
+  <div class="bs-foot"><span id="bsPage"></span><span>数据每 5 分钟自动刷新 · 仅显示已发布排班</span></div>
+</div>
+
+<!-- 班次选择浮层 -->
+<div class="pop" id="pop">
+  <div class="t" id="popTitle"></div>
+  <div class="opts" id="popOpts"></div>
+  <textarea placeholder="备注（可选）"></textarea>
+</div>
+
+<!-- 调班弹窗 -->
+<div class="modal-bg" id="swapModal">
+  <div class="modal">
+    <h2>新建调班申请</h2>
+    <div class="row"><label>类型</label><select><option>与同事换班</option><option>请假</option><option>替班（对方替我上）</option></select></div>
+    <div class="row"><label>我的班次</label><select><option>10-13 夜班</option><option>10-19 白班</option></select></div>
+    <div class="row"><label>对方</label><select id="swapTo"></select></div>
+    <div class="row"><label>对方班次</label><select><option>10-14 白班</option></select></div>
+    <div class="row"><label>原因</label><textarea rows="3"></textarea></div>
+    <div class="foot"><button onclick="closeModal('swapModal')">取消</button><button class="primary" onclick="closeModal('swapModal');alert('已提交，等待对方确认')">提交</button></div>
+  </div>
+</div>
+
+<!-- 节假日弹窗 -->
+<div class="modal-bg" id="holModal">
+  <div class="modal">
+    <h2>添加节假日</h2>
+    <div class="row"><label>名称</label><input placeholder="如：春节"></div>
+    <div class="row"><label>类型</label><select><option>放假</option><option>调休上班</option></select></div>
+    <div class="row"><label>开始日期</label><input type="date" value="2027-02-06"></div>
+    <div class="row"><label>结束日期</label><input type="date" value="2027-02-12"></div>
+    <div class="row"><label>说明</label><input placeholder="选填"></div>
+    <div class="foot"><button onclick="closeModal('holModal')">取消</button><button class="primary" onclick="closeModal('holModal');alert('已添加')">保存</button></div>
+  </div>
+</div>
+
+<!-- 人员弹窗 -->
+<div class="modal-bg" id="staffModal">
+  <div class="modal">
+    <h2>新增人员</h2>
+    <div class="row"><label>工号</label><input placeholder="必填，唯一，同时作为登录用户名"></div>
+    <div class="row"><label>姓名</label><input></div>
+    <div class="row"><label>岗位</label><input placeholder="选填，如：工程师"></div>
+    <div class="row"><label>联系电话</label><input placeholder="选填"></div>
+    <div class="row"><label>参与排班</label><select><option>是</option><option>否（如科长本人不排班）</option></select></div>
+    <div class="row"><label>角色</label><select><option>普通成员</option><option>科长（管理员）</option></select></div>
+    <div class="foot"><button onclick="closeModal('staffModal')">取消</button><button class="primary" onclick="closeModal('staffModal');alert('已新增，初始密码已生成')">保存</button></div>
+  </div>
+</div>
+
+<script>
+const SHIFTS=[
+  {k:'D',name:'白班',time:'08:00-17:30',h:8,cross:false},
+  {k:'N',name:'夜班',time:'17:30-次日08:00',h:14.5,cross:true},
+  {k:'Z',name:'值班',time:'08:00-次日08:00',h:24,cross:true},
+  {k:'B',name:'备班',time:'电话待命',h:0,cross:false},
+  {k:'L',name:'请假',time:'—',h:0,cross:false},
+  {k:'X',name:'休息',time:'—',h:0,cross:false},
+];
+const SH=Object.fromEntries(SHIFTS.map(s=>[s.k,s]));
+const STAFF=[
+  {id:'IT001',n:'陈静',pos:'工程师',tel:'138****0001'},
+  {id:'IT002',n:'王磊',pos:'工程师',tel:'138****0002'},
+  {id:'IT003',n:'刘洋',pos:'工程师',tel:'138****0003'},
+  {id:'IT004',n:'赵敏',pos:'网络工程师',tel:'138****0004'},
+  {id:'IT005',n:'孙浩',pos:'',tel:'138****0005'},
+  {id:'IT006',n:'周婷',pos:'',tel:'138****0006'},
+  {id:'IT007',n:'吴刚',pos:'运维',tel:'138****0007'},
+  {id:'IT008',n:'郑凯',pos:'运维',tel:'138****0008'},
+  {id:'IT009',n:'冯雪',pos:'',tel:'138****0009'},
+  {id:'IT010',n:'何平',pos:'数据',tel:'138****0010'},
+  {id:'IT011',n:'许娜',pos:'数据',tel:'138****0011'},
+];
+const HOLIDAYS=[
+  {y:2026,name:'元旦',from:'2026-01-01',to:'2026-01-03',type:'hol'},
+  {y:2026,name:'春节',from:'2026-02-15',to:'2026-02-23',type:'hol'},
+  {y:2026,name:'劳动节',from:'2026-05-01',to:'2026-05-05',type:'hol'},
+  {y:2026,name:'国庆节',from:'2026-10-01',to:'2026-10-07',type:'hol'},
+  {y:2026,name:'国庆调休',from:'2026-10-10',to:'2026-10-10',type:'work'},
+  {y:2027,name:'元旦',from:'2027-01-01',to:'2027-01-01',type:'hol'},
+];
+const HOL=new Set(),WORK=new Set();
+HOLIDAYS.forEach(h=>{for(let d=new Date(h.from);d<=new Date(h.to);d.setDate(d.getDate()+1)){const s=d.toISOString().slice(0,10);(h.type==='hol'?HOL:WORK).add(s)}});
+const TODAY='2026-10-13';
+let Y=2026,M=10,view='month',weekStart=12,published=true;
+let data={},manual=new Set();
+const pad=n=>String(n).padStart(2,'0');
+const key=(y,m,d)=>`${y}-${pad(m)}-${pad(d)}`;
+const WD='日一二三四五六';
+const days=()=>new Date(Y,M,0).getDate();
+function isOff(ds){const w=new Date(ds).getDay();return HOL.has(ds)||((w==0||w==6)&&!WORK.has(ds))}
+
+// 规则：工作日白班，双休/节假日休息
+function genDefault(ask){
+  if(ask&&!confirm('按规则重新生成本月排班？\n将覆盖未手工修改的格子，手工调整（夜班/值班/备班/请假）保留。'))return;
+  const n=days();
+  STAFF.forEach(s=>{for(let d=1;d<=n;d++){const k=s.id+'|'+key(Y,M,d);if(!manual.has(k))data[k]=isOff(key(Y,M,d))?'X':'D';}});
+  if(ask){published=false;}
+  render();
+}
+function setManual(id,d,v){const k=id+'|'+key(Y,M,d);data[k]=v;manual.add(k)}
+function demoManual(){
+  setManual('IT002',13,'N');setManual('IT002',14,'X');
+  setManual('IT004',3,'Z');setManual('IT007',5,'Z');setManual('IT010',1,'B');
+  setManual('IT006',15,'L');setManual('IT006',16,'L');
+  setManual('IT003',20,'N');setManual('IT003',21,'X');
+}
+function publish(){
+  if(!confirm(`确认发布 ${Y}年${M}月 排班？\n发布后全科成员与大屏可见。`))return;
+  published=true;render();
+}
+const role=()=>document.getElementById('role').value;
+
+function render(){
+  document.getElementById('monthLabel').textContent=`${Y}年${M}月`;
+  const st=document.getElementById('pubState');
+  st.className='tag '+(published?'pub':'draft');st.textContent=published?'已发布 · v1':'草稿 · 未发布（修改后需重新发布）';
+  const n=days();
+  const ds_=[];if(view==='month'){for(let d=1;d<=n;d++)ds_.push(d)}else{for(let d=weekStart;d<weekStart+7&&d<=n;d++)ds_.push(d)}
+  const kw=document.getElementById('kw').value.trim();
+  let h='<thead><tr><th class="name">姓名</th>';
+  ds_.forEach(d=>{const ds=key(Y,M,d),w=new Date(ds).getDay();h+=`<th class="${HOL.has(ds)?'hol':WORK.has(ds)?'wk':isOff(ds)?'we':''}">${d}<small>${HOL.has(ds)?'假':WORK.has(ds)?'班':'周'+WD[w]}</small></th>`});
+  h+='<th>夜/值</th><th>工时</th></tr></thead><tbody>';
+  STAFF.filter(s=>!kw||s.n.includes(kw)||s.id.includes(kw)).forEach(s=>{
+    const me=role()==='member'&&s.n==='王磊';
+    h+=`<tr><td class="name ${me?'me-row':''}">${s.n}</td>`;
+    let nn=0,hh=0;
+    for(let d=1;d<=n;d++){const v=data[s.id+'|'+key(Y,M,d)];if(v==='N'||v==='Z')nn++;if(v)hh+=SH[v].h;}
+    ds_.forEach(d=>{const ds=key(Y,M,d),k=s.id+'|'+ds,v=data[k]||'';
+      h+=`<td class="cell ${manual.has(k)?'manual':''} ${me?'me-row':''}" data-s="${s.id}" data-d="${ds}">${v?`<span class="sh sh-${v}">${SH[v].name}</span>`:''}</td>`});
+    h+=`<td>${nn}</td><td>${hh}</td></tr>`;
+  });
+  h+='<tr class="cov"><td class="name">白班在岗</td>';
+  ds_.forEach(d=>{const ds=key(Y,M,d);h+=`<td>${STAFF.filter(s=>data[s.id+'|'+ds]==='D').length}</td>`});
+  h+='<td></td><td></td></tr><tr class="cov"><td class="name">夜班/值班</td>';
+  ds_.forEach(d=>{const ds=key(Y,M,d);h+=`<td>${STAFF.filter(s=>['N','Z'].includes(data[s.id+'|'+ds])).length}</td>`});
+  h+='<td></td><td></td></tr></tbody>';
+  document.getElementById('grid').innerHTML=h;
+  const adm=role()==='admin';
+  document.querySelectorAll('.edit-only').forEach(e=>e.style.display=adm?'':'none');
+  document.querySelectorAll('.edit-only-block,.adm-inline').forEach(e=>e.style.display=adm?'':'none');
+  renderMine();renderStats();
+}
+
+const pop=document.getElementById('pop');
+document.getElementById('grid').addEventListener('click',e=>{
+  const td=e.target.closest('td.cell');if(!td||role()!=='admin')return;
+  const s=STAFF.find(x=>x.id===td.dataset.s);
+  document.getElementById('popTitle').textContent=`${s.n} · ${td.dataset.d}`;
+  document.getElementById('popOpts').innerHTML=SHIFTS.map(x=>`<span class="sh sh-${x.k}" data-k="${x.k}">${x.name}</span>`).join('')+'<span class="sh" data-k="" style="border:1px dashed #ccc;grid-column:span 3">恢复为规则默认</span>';
+  pop.dataset.key=s.id+'|'+td.dataset.d;
+  const r=td.getBoundingClientRect();pop.style.left=Math.min(r.left,innerWidth-240)+'px';pop.style.top=Math.min(r.bottom+4,innerHeight-190)+'px';pop.style.display='block';
+  e.stopPropagation();
+});
+document.getElementById('popOpts').addEventListener('click',e=>{const k=e.target.dataset.k;if(k===undefined)return;const pk=pop.dataset.key;
+  if(k){data[pk]=k;manual.add(pk)}else{manual.delete(pk);data[pk]=isOff(pk.split('|')[1])?'X':'D'}
+  published=false;pop.style.display='none';render();});
+document.addEventListener('click',e=>{if(!pop.contains(e.target))pop.style.display='none'});
+
+function renderMine(){
+  const me=STAFF.find(s=>s.n==='王磊');const n=days();
+  document.getElementById('mineLabel').textContent=`${Y}年${M}月 · ${me.n}`;
+  let c={D:0,N:0,Z:0},hh=0,next='-';
+  let h=[...WD].map(w=>`<div class="h">周${w}</div>`).join('');
+  const first=new Date(Y,M-1,1).getDay();for(let i=0;i<first;i++)h+='<div class="d empty"></div>';
+  for(let d=1;d<=n;d++){const ds=key(Y,M,d),v=data[me.id+'|'+ds];if(v in c)c[v]++;if(v)hh+=SH[v].h;
+    if(next==='-'&&ds>TODAY&&v&&['D','N','Z'].includes(v))next=`${M}-${d} ${SH[v].name}`;
+    h+=`<div class="d ${ds===TODAY?'today':''} ${HOL.has(ds)?'hol':''}"><div class="n">${d}${HOL.has(ds)?' 假':WORK.has(ds)?' 班':''}</div>${v?`<span class="sh sh-${v}">${SH[v].name}</span><div class="note">${SH[v].time}</div>`:''}</div>`}
+  document.getElementById('cal').innerHTML=h;
+  k1.textContent=c.D;k2.textContent=c.N+' / '+c.Z;k3.textContent=hh;k4.textContent=next;
+}
+function renderStats(){
+  const n=days();
+  document.getElementById('statBody').innerHTML=STAFF.map(s=>{let c={D:0,N:0,Z:0,B:0,L:0},off=0,hh=0;
+    for(let d=1;d<=n;d++){const ds=key(Y,M,d),v=data[s.id+'|'+ds];if(v in c)c[v]++;if(v)hh+=SH[v].h;if(isOff(ds)&&['D','N','Z'].includes(v))off++;}
+    return `<tr><td>${s.n}</td><td>${c.D}</td><td>${c.N}</td><td>${c.Z}</td><td>${c.B}</td><td>${c.L}</td><td>${off}</td><td>${hh}</td></tr>`}).join('');
+}
+function renderHolidays(){
+  const y=+document.getElementById('holYear').value;
+  document.getElementById('holBody').innerHTML=HOLIDAYS.filter(h=>h.y===y).map(h=>{
+    const dn=(new Date(h.to)-new Date(h.from))/864e5+1;
+    return `<tr><td>${h.name}</td><td>${h.from.slice(5)}${h.from!==h.to?' ~ '+h.to.slice(5):''}</td><td>${dn}</td><td><span class="tag ${h.type}">${h.type==='hol'?'放假':'调休上班'}</span></td><td></td><td><button class="link">编辑</button><button class="link" style="color:#d64545">删除</button></td></tr>`}).join('')
+    ||'<tr><td colspan="6" class="note" style="text-align:center">暂无，点击“添加节假日”录入</td></tr>';
+}
+function staticTables(){
+  document.getElementById('legend').innerHTML=SHIFTS.map(s=>`<span><span class="sh sh-${s.k}">${s.name}</span>${s.time}</span>`).join('');
+  document.getElementById('shiftBody').innerHTML=SHIFTS.map(s=>`<tr><td><span class="sh sh-${s.k}">${s.k}</span></td><td>${s.name}</td><td>${s.time}</td><td>${s.h}</td><td>${s.cross?'✔':''}</td><td><span class="tag pub">启用</span></td><td><button class="link">编辑</button></td></tr>`).join('');
+  document.getElementById('staffBody').innerHTML=STAFF.map(s=>`<tr><td class="drag">☰</td><td>${s.id}</td><td>${s.n}</td><td>${s.pos||'<span class="note">—</span>'}</td><td>${s.tel}</td><td>✔</td><td>${s.id}</td><td><button class="link">编辑</button><button class="link">停用</button></td></tr>`).join('');
+  document.getElementById('userBody').innerHTML=
+    `<tr><td>admin</td><td>李主任</td><td>科长（管理员）</td><td><span class="tag pub">正常</span></td><td>2026-10-13 08:12</td><td><button class="link">重置密码</button></td></tr>
+     <tr><td>screen</td><td>值班大屏</td><td>大屏账号</td><td><span class="tag pub">正常</span></td><td>2026-10-13 07:59</td><td><button class="link">重置密码</button></td></tr>`+
+    STAFF.slice(0,4).map((s,i)=>`<tr><td>${s.id}</td><td>${s.n}</td><td>普通成员</td><td><span class="tag ${i==3?'rejected':'pub'}">${i==3?'已锁定':'正常'}</span></td><td>2026-10-1${i} 09:0${i}</td><td><button class="link">重置密码</button>${i==3?'<button class="link">解锁</button>':'<button class="link">停用</button>'}</td></tr>`).join('');
+  document.getElementById('swapTo').innerHTML=STAFF.filter(s=>s.n!=='王磊').map(s=>`<option>${s.n}</option>`).join('');
+  const sw=[['TB-0015','换班','王磊','10-13 夜班','刘洋 · 10-14 白班','家中有事','pending','待科长审批'],
+            ['TB-0014','请假','周婷','10-15 ~ 10-16 白班','—','病假','pending','待科长审批'],
+            ['TB-0013','替班','孙浩','10-08 白班','赵敏','外出培训','approved','已通过'],
+            ['TB-0012','换班','郑凯','10-03 值班','冯雪 · 10-05 值班','—','rejected','已驳回']];
+  document.getElementById('swapBody').innerHTML=sw.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td><td>${r[4]}</td><td>${r[5]}</td><td><span class="tag ${r[6]}">${r[7]}</span></td><td>${r[6]==='pending'?'<button class="link approve">通过</button><button class="link approve" style="color:#d64545">驳回</button>':''}<button class="link">详情</button></td></tr>`).join('');
+  renderHolidays();
+}
+
+// ===== 大屏 =====
+let bsTimer=null,bsPageIdx=0;
+const BS_ROWS=12; // 每页最多显示人数，超出自动翻页
+function openScreen(){
+  const el=document.getElementById('bigscreen');el.classList.add('on');
+  if(el.requestFullscreen)el.requestFullscreen().catch(()=>{});
+  bsPageIdx=0;renderScreen();clearInterval(bsTimer);
+  bsTimer=setInterval(()=>{bsPageIdx++;renderScreen()},15000);
+}
+function closeScreen(){document.getElementById('bigscreen').classList.remove('on');clearInterval(bsTimer);if(document.fullscreenElement)document.exitFullscreen();}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeScreen()});
+document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)document.getElementById('bigscreen').classList.remove('on')});
+function renderScreen(){
+  const t=new Date(TODAY),w=t.getDay()||7;
+  const mon=new Date(t);mon.setDate(t.getDate()-w+1);
+  const week=[...Array(7)].map((_,i)=>{const d=new Date(mon);d.setDate(mon.getDate()+i);return d});
+  const iso=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  document.getElementById('bsSub').textContent=`${M}月${week[0].getDate()}日 — ${M}月${week[6].getDate()}日 · 本周排班`;
+  const pages=Math.ceil(STAFF.length/BS_ROWS),p=bsPageIdx%pages;
+  const rows=STAFF.slice(p*BS_ROWS,(p+1)*BS_ROWS);
+  let h='<thead><tr><th style="width:11vw">姓名</th>';
+  week.forEach(d=>{const ds=iso(d);h+=`<th class="${ds===TODAY?'today':''} ${HOL.has(ds)?'hol':''}">${d.getMonth()+1}/${d.getDate()}<small>${ds===TODAY?'今天 · ':''}周${WD[d.getDay()]}${HOL.has(ds)?' · 假':WORK.has(ds)?' · 调休上班':''}</small></th>`});
+  h+='</tr></thead><tbody>';
+  rows.forEach(s=>{h+=`<tr><td class="nm">${s.n}</td>`;week.forEach(d=>{const ds=iso(d),v=data[s.id+'|'+ds];h+=`<td class="${ds===TODAY?'today':''}">${v?`<span class="sh sh-${v}">${SH[v].name}</span>`:''}</td>`});h+='</tr>'});
+  h+='</tbody>';
+  document.getElementById('bsGrid').innerHTML=h;
+  const who=k=>STAFF.filter(s=>data[s.id+'|'+TODAY]===k).map(s=>s.n);
+  const card=(l,a)=>`<div class="c"><div class="l">${l}</div><div class="v">${a.length?a.join('、'):'—'}</div></div>`;
+  document.getElementById('bsToday').innerHTML=
+    `<div class="c"><div class="l">今日白班在岗</div><div class="v">${who('D').length} 人</div></div>`+
+    card('今晚夜班',who('N'))+card('今日值班',who('Z'))+card('今日请假',who('L'));
+  document.getElementById('bsPage').textContent=pages>1?`第 ${p+1}/${pages} 页 · 每 15 秒自动翻页`:'';
+  const now=new Date();
+  document.getElementById('bsTime').textContent=`${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  document.getElementById('bsDate').textContent=`${t.getFullYear()}年${t.getMonth()+1}月${t.getDate()}日 星期${WD[t.getDay()]}`;
+}
+
+function shiftMonth(k){if(view==='week'){weekStart=Math.max(1,Math.min(days()-6,weekStart+7*k));render();return;}alert('演示数据仅包含 2026年10月');}
+function openSwap(){openModal('swapModal')}
+function openModal(id){document.getElementById(id).style.display='flex'}
+function closeModal(id){document.getElementById(id).style.display='none'}
+function go(p){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id==='p-'+p));document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('active',a.dataset.p===p));document.getElementById('nav').style.display=p==='login'?'none':'';}
+document.getElementById('nav').addEventListener('click',e=>{const a=e.target.closest('a');if(a)go(a.dataset.p)});
+document.getElementById('viewSeg').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;view=b.dataset.v;document.querySelectorAll('#viewSeg button').forEach(x=>x.classList.toggle('on',x===b));render();});
+document.getElementById('kw').oninput=render;
+document.getElementById('holYear').onchange=renderHolidays;
+document.getElementById('role').onchange=()=>{const r=role();
+  document.getElementById('who').textContent=r==='admin'?'科长 · 李主任':'成员 · 王磊';
+  document.querySelectorAll('nav .adm').forEach(a=>a.classList.toggle('hide',r!=='admin'));
+  document.querySelectorAll('.approve').forEach(b=>b.style.display=r==='admin'?'':'none');
+  if(r!=='admin'&&document.querySelector('nav a.active')?.classList.contains('adm'))go('schedule');
+  render();};
+staticTables();demoManual();genDefault(false);
+if(location.hash==='#screen')openScreen();else if(location.hash)go(location.hash.slice(1));
+</script>
+</body>
+</html>
