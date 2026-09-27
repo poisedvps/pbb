@@ -77,6 +77,34 @@ class OpLogServiceTest {
     }
 
     @Test
+    void recordFallsBackToRemoteAddrWhenForwardedForIsMalformed() {
+        request.addHeader("X-Forwarded-For", ",,");
+
+        service.recordAs(1L, "admin", OpAction.LOGIN, "admin", null);
+
+        assertEquals("127.0.0.1", captured().getIp());
+    }
+
+    @Test
+    void recordFallsBackToRemoteAddrWhenFirstForwardedIpIsTooLong() {
+        request.addHeader("X-Forwarded-For", "f".repeat(46) + ", 127.0.0.2");
+
+        service.recordAs(1L, "admin", OpAction.LOGIN, "admin", null);
+
+        assertEquals("127.0.0.1", captured().getIp());
+    }
+
+    @Test
+    void recordKeepsFirstForwardedIpAtMaxLength() {
+        String ip45 = "f".repeat(45);
+        request.addHeader("X-Forwarded-For", ip45 + ", 127.0.0.2");
+
+        service.recordAs(1L, "admin", OpAction.LOGIN, "admin", null);
+
+        assertEquals(ip45, captured().getIp());
+    }
+
+    @Test
     void recordWithoutLoginLeavesUserNull() {
         service.record(OpAction.CREATE_STAFF, "IT002", "x");
 

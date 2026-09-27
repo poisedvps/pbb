@@ -18,6 +18,7 @@ public class OpLogService {
 
     private static final int TARGET_MAX = 100;
     private static final int DETAIL_MAX = 500;
+    private static final int IP_MAX = 45;
     private static final String X_FORWARDED_FOR = "X-Forwarded-For";
 
     private final OperationLogRepository repository;
@@ -58,8 +59,10 @@ public class OpLogService {
         HttpServletRequest req = attrs.getRequest();
         String forwarded = req.getHeader(X_FORWARDED_FOR);
         if (forwarded != null) {
-            String first = forwarded.split(",")[0].trim();
-            if (!first.isEmpty()) {
+            int comma = forwarded.indexOf(',');
+            String first = (comma < 0 ? forwarded : forwarded.substring(0, comma)).trim();
+            // 请求头内容由客户端可控，空白或长度超过字段长度时不能直接入库
+            if (!first.isEmpty() && first.length() <= IP_MAX) {
                 return first;
             }
         }
