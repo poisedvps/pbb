@@ -95,14 +95,22 @@ const loading = ref(false)
 const copying = ref(false)
 const saving = ref(false)
 
+// 年份切换会并发发出多个 listHolidays，慢的旧响应不能盖掉新的：每次重载领一个递增号，
+// 只有仍是「最新」的那一次才允许写 list 与关 loading
+let reqSeq = 0
+
 const reload = async () => {
+  const seq = ++reqSeq
   loading.value = true
   try {
-    list.value = await listHolidays(year.value)
+    const data = await listHolidays(year.value)
+    // 期间又切过年份（或发生过别的重载）：这份响应作废，不覆盖当前年份的列表
+    if (seq === reqSeq) list.value = data
   } catch {
-    // 失败提示由 http 拦截器统一弹出
+    // 失败提示由 http 拦截器统一弹出；旧请求失败也不动当前列表
   } finally {
-    loading.value = false
+    // 旧请求也不能把加载态关掉，否则新请求还在飞 loading 就提前消失了
+    if (seq === reqSeq) loading.value = false
   }
 }
 onMounted(reload)
