@@ -11,4 +11,7 @@ public interface AppUserRepository extends JpaRepository<AppUser, Long> {
     boolean existsByUsername(String username);
 
     List<AppUser> findAllByOrderByIdAsc();
+
+    /** 人员与账号一对一（app_user.staff_id），人员模块用它同步姓名和启停状态 */
+    Optional<AppUser> findByStaffId(Long staffId);
 }
