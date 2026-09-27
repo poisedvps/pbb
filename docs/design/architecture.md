@@ -29,7 +29,7 @@
 ```
 
 - 服务器部署方案与端口见 `docs/design/deploy.md`（测试服务器对外端口 8097，本地开发仍为 8090）。
-- 所有密钥（数据库密码、JWT 密钥、初始管理员密码）只存在服务器上的 `.env`（git 忽略），仓库只有 `.env.example` 占位符。
+- 所有密钥（数据库密码、JWT 密钥）只存在服务器上的 `.env`（git 忽略），仓库只有 `.env.example` 占位符。初始管理员密码例外，见 §6。
 - 时区统一 `Asia/Shanghai`；日期字段用 `date`，时间戳用 `timestamptz`。
 
 ## 3. 模块划分
@@ -126,7 +126,9 @@ for 每个 schedulable 且 active 的人员 s:
 
 ## 6. 安全规范
 
-- 密码 BCrypt 存储；初始管理员 `admin` 首次启动时由 `.env` 的 `PBB_ADMIN_INIT_PASSWORD` 创建，`must_change_password=true`。
+- 密码 BCrypt 存储；库中没有 `admin` 时，启动时自动创建初始管理员 `admin`，`must_change_password=true`。
+- 初始管理员密码固定默认为 `admin`（需求方 2026-09-27 确认）：第一次登录成功后强制跳转到改密页，改密前除 `/auth/me`、`/auth/change-password`、`/auth/logout` 外的接口都返回 4031。`.env` 中的 `PBB_ADMIN_INIT_PASSWORD` 若填了非占位值就以它为准；为空、`change-me` 或 `<...>` 占位符时一律使用 `admin`。
+- 风险：新环境部署后到科长首次改密之前，内网任何人都能用 `admin/admin` 登录。部署后应立即登录改密。
 - 认证：登录返回 JWT（HS256，密钥来自 `.env`，有效期 12 小时；SCREEN 账号 30 天）；前端存 `localStorage`，请求头 `Authorization: Bearer`。
 - 所有写操作记录 `operation_log`；日志不得输出密码、token、完整手机号。
 - 接口层按角色鉴权（`@PreAuthorize`），前端隐藏菜单只是体验，不是安全手段。
