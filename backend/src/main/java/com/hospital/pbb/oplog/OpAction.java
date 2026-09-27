@@ -21,6 +21,17 @@ public final class OpAction {
     public static final String DELETE_HOLIDAY = "删除节假日";
     public static final String COPY_HOLIDAY = "复制节假日";
 
+    public static final String UPDATE_SCHEDULE = "修改排班";
+    public static final String GENERATE_SCHEDULE = "按规则生成排班";
+    public static final String PUBLISH_SCHEDULE = "发布排班";
+    public static final String APPLY_SWAP_TO_SCHEDULE = "调班回写排班";
+    public static final String CREATE_SWAP = "发起调班";
+    public static final String CONFIRM_SWAP = "同意调班";
+    public static final String REJECT_SWAP_PEER = "拒绝调班";
+    public static final String CANCEL_SWAP = "撤销调班";
+    public static final String APPROVE_SWAP = "审批通过调班";
+    public static final String REJECT_SWAP = "审批驳回调班";
+
     private OpAction() {
     }
 }
