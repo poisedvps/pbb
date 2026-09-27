@@ -1,6 +1,7 @@
 # 密钥与部署配置
 .env
 scripts/deploy.env
+.smoke-admin-password
 
 # 构建产物
 node_modules/
