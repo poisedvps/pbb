@@ -7,10 +7,14 @@ cd "$(dirname "$0")/.."
 [ -f scripts/deploy.env ] || { echo "缺少 scripts/deploy.env，请从 deploy.env.example 复制并填写"; exit 1; }
 # shellcheck disable=SC1091
 source scripts/deploy.env
+SUDO_NOPASS="${SUDO_NOPASS:-0}"
+PBB_HTTP_PORT="${PBB_HTTP_PORT:-}"
 SSH_KEY="${SSH_KEY/#\~/$HOME}"
 SSH=(ssh -i "$SSH_KEY" -p "$DEPLOY_PORT" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST")
 
-if [ -t 0 ]; then read -rsp "服务器 sudo 密码: " SUDO_PW; echo; else read -r SUDO_PW; fi
+if [ "$SUDO_NOPASS" != "1" ]; then
+  if [ -t 0 ]; then read -rsp "服务器 sudo 密码: " SUDO_PW; echo; else read -r SUDO_PW; fi
+fi
 
 echo "==> 同步代码到 $DEPLOY_HOST:$DEPLOY_DIR"
 "${SSH[@]}" "mkdir -p '$DEPLOY_DIR'"
@@ -21,4 +25,8 @@ rsync -az --delete \
   ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_DIR/"
 
 echo "==> 服务器端构建并启动"
-printf '%s\n' "$SUDO_PW" | "${SSH[@]}" "sudo -S -p '' bash '$DEPLOY_DIR/scripts/remote-deploy.sh' '$DEPLOY_DIR'"
+if [ "$SUDO_NOPASS" = "1" ]; then
+  "${SSH[@]}" "sudo -n bash '$DEPLOY_DIR/scripts/remote-deploy.sh' '$DEPLOY_DIR' '$PBB_HTTP_PORT'"
+else
+  printf '%s\n' "$SUDO_PW" | "${SSH[@]}" "sudo -S -p '' bash '$DEPLOY_DIR/scripts/remote-deploy.sh' '$DEPLOY_DIR' '$PBB_HTTP_PORT'"
+fi
