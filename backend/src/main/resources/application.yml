@@ -35,7 +35,7 @@ management:
 pbb:
   # 以下均从环境变量（服务器 .env）读取，禁止在此写真实值
   jwt-secret: ${PBB_JWT_SECRET:change-me}
-  admin-init-password: ${PBB_ADMIN_INIT_PASSWORD:change-me}
+  admin-init-password: ${PBB_ADMIN_INIT_PASSWORD:admin}
 
 logging:
   level:
