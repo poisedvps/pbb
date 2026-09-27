@@ -22,7 +22,6 @@ if [ ! -f .env ]; then
   echo "==> 首次部署：生成 .env（随机密码，仅保存在服务器）"
   sed -e "s|^DB_PASSWORD=.*|DB_PASSWORD=$(openssl rand -hex 16)|" \
       -e "s|^PBB_JWT_SECRET=.*|PBB_JWT_SECRET=$(openssl rand -hex 32)|" \
-      -e "s|^PBB_ADMIN_INIT_PASSWORD=.*|PBB_ADMIN_INIT_PASSWORD=Pbb$(openssl rand -hex 4)|" \
       .env.example > .env
   chmod 600 .env
 fi
