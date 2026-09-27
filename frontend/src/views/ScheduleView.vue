@@ -15,6 +15,7 @@
       <el-input v-model="keyword" class="kw" placeholder="搜索姓名/工号" clearable />
       <div class="sp"></div>
       <el-button v-if="auth.isAdmin" :loading="working" :disabled="monthLocked || saving || loading" @click="generate">⚡ 按规则生成</el-button>
+      <el-button :disabled="loading" @click="exportExcel">导出 Excel</el-button>
       <el-button @click="print">打印</el-button>
       <el-button v-if="auth.isAdmin" class="screen-btn" @click="openScreen">🖥 大屏展示</el-button>
       <el-button v-if="auth.isAdmin" type="primary" :loading="working" :disabled="monthLocked || saving || loading" @click="publish">发布排班</el-button>
@@ -106,6 +107,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { generateSchedule, getSchedule, publishSchedule, updateEntry } from '../api/schedules'
+import { download } from '../api/download'
 import { listShiftTypes } from '../api/shifts'
 import { useAuthStore } from '../stores/auth'
 
@@ -175,6 +177,13 @@ const monthText = computed(() => labelOf(ym.value))
 // 屏幕上这份表到底是哪个月以 data 为准：切月请求还在路上时它仍是上一份成功数据，
 // 科长此刻看到、能点到的格子也都属于这个月，写入必须打给这个月而不是 ym
 const viewYm = () => data.value?.yearMonth || ''
+
+// 导出跟着屏幕走而不是 ym：切月请求还在路上时 data 仍是上一份成功数据，此刻看到的也只有那个月
+const exportExcel = () => {
+  const target = viewYm()
+  if (!target) return
+  download('/schedules/' + target + '/export', null, '排班表-' + target + '.xlsx')
+}
 
 const statusTag = computed(() => {
   if (data.value?.status === 'PUBLISHED') return { type: 'success', text: `已发布 v${data.value.version}` }
