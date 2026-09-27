@@ -7,6 +7,7 @@ import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
+import com.hospital.pbb.schedule.dto.PublishResultVO;
 import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
@@ -157,6 +158,13 @@ class ScheduleServiceTest {
     private ScheduleMonth savedMonth() {
         ArgumentCaptor<ScheduleMonth> captor = ArgumentCaptor.forClass(ScheduleMonth.class);
         verify(monthRepo).save(captor.capture());
+        return captor.getValue();
+    }
+
+    /** 发布是整月重写快照，saveAll 应恰好被调用一次 */
+    private List<SchedulePublishedEntry> savedSnapshots() {
+        ArgumentCaptor<List<SchedulePublishedEntry>> captor = ArgumentCaptor.captor();
+        verify(publishedRepo).saveAll(captor.capture());
         return captor.getValue();
     }
 
@@ -439,5 +447,104 @@ class ScheduleServiceTest {
         verify(publishedRepo, never()).deleteByWorkDateRange(any(), any());
         verify(entryRepo, never()).delete(any());
         verify(opLog, never()).record(eq(OpAction.PUBLISH_SCHEDULE), anyString(), anyString());
+    }
+
+    // ---------- publish ----------
+
+    /** 10-05 带备注的草稿、10-10 手工改过的草稿，发布后这两列都要原样带走 */
+    private static List<ScheduleEntry> threeDrafts() {
+        ScheduleEntry withRemark = draft(1L, D5, "N", true);
+        withRemark.setRemark("顶班");
+        return List.of(withRemark, draft(2L, D5, "D", false), draft(1L, D10, "X", false));
+    }
+
+    /** 用例：草稿 3 条、schedule_month 里无记录 → 返回 (1, 3)，快照按草稿逐格复制，不写草稿表 */
+    @Test
+    void publishCopiesDraftIntoSnapshotAndReturnsFirstVersion() {
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
+
+        PublishResultVO result = service.publish(YM, OPERATOR);
+
+        assertEquals(new PublishResultVO(1, 3), result);
+        List<SchedulePublishedEntry> saved = savedSnapshots();
+        assertEquals(3, saved.size());
+        SchedulePublishedEntry first = saved.get(0);
+        assertEquals(1L, first.getStaffId());
+        assertEquals(D5, first.getWorkDate());
+        assertEquals("N", first.getShiftCode());
+        assertEquals("顶班", first.getRemark());
+        assertEquals(1, first.getVersion());
+        assertEquals(2L, saved.get(1).getStaffId());
+        assertEquals("D", saved.get(1).getShiftCode());
+        assertNull(saved.get(1).getRemark());
+        assertEquals(D10, saved.get(2).getWorkDate());
+        // 发布只读草稿，不重写格子
+        verify(entryRepo, never()).save(any(ScheduleEntry.class));
+    }
+
+    /** 用例：先删旧快照再存新快照，且都在取到当月锁之后 */
+    @Test
+    void publishDeletesOldSnapshotBeforeSavingNewOne() {
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
+
+        service.publish(YM, OPERATOR);
+
+        InOrder order = inOrder(monthRepo, publishedRepo);
+        order.verify(monthRepo).lockMonth(LOCK_KEY);
+        order.verify(publishedRepo).deleteByWorkDateRange(START, END);
+        order.verify(publishedRepo).saveAll(any());
+    }
+
+    /** 用例：从未发布过的月份置为 PUBLISHED、version=1、publishedAt/publishedBy 写入 */
+    @Test
+    void publishMarksMonthPublishedWithOperatorAndTime() {
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
+
+        service.publish(YM, OPERATOR);
+
+        ScheduleMonth saved = savedMonth();
+        assertEquals(YM, saved.getYearMonth());
+        assertEquals(ScheduleStatus.PUBLISHED, saved.getStatus());
+        assertEquals(1, saved.getVersion());
+        assertEquals(OPERATOR, saved.getPublishedBy());
+        assertEquals(NOW, saved.getPublishedAt());
+        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v1，共3格");
+    }
+
+    /** 用例：月份 version=2 时再次发布 → 返回 version=3，快照上的 version 跟着走 */
+    @Test
+    void publishIncrementsExistingVersion() {
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(month(ScheduleStatus.DRAFT, 2)));
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
+
+        PublishResultVO result = service.publish(YM, OPERATOR);
+
+        assertEquals(3, result.version());
+        assertEquals(3, result.count());
+        assertEquals(3, savedMonth().getVersion());
+        assertEquals(3, savedSnapshots().get(0).getVersion());
+        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v3，共3格");
+    }
+
+    /** 用例：整月无草稿 → 1504，旧快照不能被误删 */
+    @Test
+    void publishRejectsMonthWithoutAnyDraft() {
+        BizException e = assertThrows(BizException.class, () -> service.publish(YM, OPERATOR));
+
+        assertEquals(1504, e.getCode());
+        verify(publishedRepo, never()).deleteByWorkDateRange(any(), any());
+        verify(publishedRepo, never()).saveAll(any());
+        verify(monthRepo, never()).save(any(ScheduleMonth.class));
+        verify(opLog, never()).record(anyString(), anyString(), anyString());
+    }
+
+    /** 用例：月份格式不对 → 1500，锁都不取 */
+    @Test
+    void publishRejectsBadMonthFormat() {
+        BizException e = assertThrows(BizException.class, () -> service.publish("202610", OPERATOR));
+
+        assertEquals(1500, e.getCode());
+        verify(monthRepo, never()).lockMonth(LOCK_KEY);
+        verify(publishedRepo, never()).deleteByWorkDateRange(any(), any());
     }
 }

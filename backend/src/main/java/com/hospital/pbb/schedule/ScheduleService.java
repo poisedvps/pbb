@@ -5,6 +5,7 @@ import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
+import com.hospital.pbb.schedule.dto.PublishResultVO;
 import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
@@ -166,6 +167,67 @@ public class ScheduleService {
         opLog.record(OpAction.UPDATE_SCHEDULE, staff.getName() + " " + workDate.format(MONTH_DAY),
                 (oldCode == null ? "" : oldCode) + " → " + shiftCode);
         return new CellVO(shiftCode, manual, remark);
+    }
+
+    /**
+     * 发布整月排班：把当前草稿整体复制成一份已发布快照。
+     *
+     * <p>快照是整月重写，不是增量补：先删掉当期快照再按草稿逐格插入，成员和大屏看到的
+     * 永远是同一次发布的那一份。发布之后科长继续改草稿只影响草稿表，月份状态被打回
+     * {@link ScheduleStatus#DRAFT}，要再次发布才生效。</p>
+     *
+     * <p>同样先取当月 advisory lock：不锁的话两个科长同时发布，删除与插入会交叉执行，
+     * 快照里会混进两个版本的数据。</p>
+     *
+     * @param yearMonth  {@code YYYY-MM}，格式不对由 {@link ScheduleMonths#parse} 抛 code=1500
+     * @param operatorId 操作人（科长）id，写入 {@code schedule_month.published_by}
+     * @return 本次发布的版本号与复制格数
+     * @throws BizException code=1504 整月还没有任何草稿，无从发布
+     */
+    @Transactional
+    public PublishResultVO publish(String yearMonth, Long operatorId) {
+        YearMonth ym = ScheduleMonths.parse(yearMonth);
+        monthRepo.lockMonth(ScheduleMonths.lockKey(ym));
+
+        LocalDate start = ym.atDay(1);
+        LocalDate end = ym.atEndOfMonth();
+        List<ScheduleEntry> entries = entryRepo.findByWorkDateBetween(start, end);
+        if (entries.isEmpty()) {
+            throw new BizException(1504, "本月还没有排班，请先按规则生成");
+        }
+
+        // 从没生成过的月份在 schedule_month 里没有记录，先按 version=0 补一条，自增后正好是 v1
+        ScheduleMonth month = monthRepo.findById(yearMonth).orElseGet(() -> {
+            ScheduleMonth created = new ScheduleMonth();
+            created.setYearMonth(yearMonth);
+            created.setVersion(0);
+            return created;
+        });
+        int newVersion = month.getVersion() + 1;
+
+        publishedRepo.deleteByWorkDateRange(start, end);
+        publishedRepo.saveAll(entries.stream().map(entry -> newSnapshot(entry, newVersion)).toList());
+
+        month.setVersion(newVersion);
+        month.setStatus(ScheduleStatus.PUBLISHED);
+        month.setPublishedAt(OffsetDateTime.now(clock));
+        month.setPublishedBy(operatorId);
+        monthRepo.save(month);
+
+        opLog.record(OpAction.PUBLISH_SCHEDULE, yearMonth,
+                "版本 v" + newVersion + "，共" + entries.size() + "格");
+        return new PublishResultVO(newVersion, entries.size());
+    }
+
+    /** 快照只带走会展示的那几列，{@code is_manual}、{@code updated_by} 这些管理字段留在草稿表里 */
+    private static SchedulePublishedEntry newSnapshot(ScheduleEntry entry, int version) {
+        SchedulePublishedEntry snapshot = new SchedulePublishedEntry();
+        snapshot.setStaffId(entry.getStaffId());
+        snapshot.setWorkDate(entry.getWorkDate());
+        snapshot.setShiftCode(entry.getShiftCode());
+        snapshot.setRemark(entry.getRemark());
+        snapshot.setVersion(version);
+        return snapshot;
     }
 
     /**
