@@ -11,12 +11,15 @@ import com.hospital.pbb.user.AppUser;
 import com.hospital.pbb.user.AppUserRepository;
 import com.hospital.pbb.user.PasswordUtil;
 import com.hospital.pbb.user.Role;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -31,6 +34,9 @@ import java.util.stream.Collectors;
  */
 @Service
 public class StaffService {
+
+    /** PostgreSQL 的唯一键冲突 SQLState（unique_violation），驱动抛的 PSQLException 属于 SQLException */
+    private static final String UNIQUE_VIOLATION_SQL_STATE = "23505";
 
     private final StaffRepository staffRepo;
     private final AppUserRepository userRepo;
@@ -67,7 +73,9 @@ public class StaffService {
             throw new BizException(1202, "人员角色只能是科长或成员");
         }
         String empNo = req.empNo();
-        // 工号即账号用户名，app_user.username 上有唯一约束，先查一次给出可读的错误
+        // 工号即账号用户名，app_user.username 上有唯一约束，先查一次给出可读的错误。
+        // 预检查只能走快路径，不保证并发正确：两个管理员同时提交同一工号会双双通过，
+        // 真正的兜底是 emp_no / username 上的唯一索引，见下面的 try。
         if (staffRepo.existsByEmpNo(empNo) || userRepo.existsByUsername(empNo)) {
             throw new BizException(1201, "工号已存在");
         }
@@ -83,7 +91,6 @@ public class StaffService {
         staff.setActive(true);
         staff.setCreatedAt(now);
         staff.setUpdatedAt(now);
-        staffRepo.save(staff);
 
         String tempPassword = PasswordUtil.randomTempPassword();
         AppUser user = new AppUser();
@@ -91,12 +98,26 @@ public class StaffService {
         user.setPasswordHash(encoder.encode(tempPassword));
         user.setDisplayName(req.name());
         user.setRole(role);
-        user.setStaffId(staff.getId());
         user.setEnabled(true);
         user.setMustChangePassword(true);
         user.setCreatedAt(now);
         user.setUpdatedAt(now);
-        userRepo.save(user);
+
+        try {
+            // 必须 saveAndFlush 而不是 save：只靠 save 时唯一键冲突可能要到事务提交才冒出来，
+            // 那时代码已离开本方法，捕获不到，只能给前端回 500。
+            staffRepo.saveAndFlush(staff);
+            user.setStaffId(staff.getId());
+            userRepo.saveAndFlush(user);
+        } catch (DataIntegrityViolationException e) {
+            if (!isDuplicateKey(e)) {
+                // 不是唯一键冲突（例如非空、外键），原样抛出，不能冒充成 1201 骗过调用方
+                throw e;
+            }
+            // 冲突后当前事务已被标成 rollback-only，这里抛 RuntimeException 让它回滚：
+            // 半途插入的人员不会留下，前端拿到 1201 后重查列表就能看到那条工号已被占用
+            throw new BizException(1201, "工号已存在");
+        }
 
         opLog.record(OpAction.CREATE_STAFF, empNo, req.name());
         return new CreateStaffResult(toVO(staff, role), empNo, tempPassword);
@@ -141,6 +162,25 @@ public class StaffService {
             staffRepo.save(staff);
         }
         opLog.record(OpAction.SORT_STAFF, ids.stream().map(String::valueOf).collect(Collectors.joining(",")), null);
+    }
+
+    /**
+     * 异常链里有没有唯一键冲突。只看 SQLState 23505 和 Spring 的 {@link DuplicateKeyException}，
+     * 不把 23502（非空）、23503（外键）这类完整性故障误判成重复工号。
+     */
+    private static boolean isDuplicateKey(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            if (t instanceof DuplicateKeyException) {
+                return true;
+            }
+            if (t instanceof SQLException sql && UNIQUE_VIOLATION_SQL_STATE.equals(sql.getSQLState())) {
+                return true;
+            }
+            if (t == t.getCause()) {
+                break;
+            }
+        }
+        return false;
     }
 
     private Staff load(Long id) {

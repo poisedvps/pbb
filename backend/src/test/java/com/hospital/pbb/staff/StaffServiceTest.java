@@ -13,9 +13,12 @@ import com.hospital.pbb.user.Role;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -30,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
@@ -58,14 +62,14 @@ class StaffServiceTest {
         opLog = mock(OpLogService.class);
 
         // 模拟数据库的自增主键，方便断言账号上的 staffId
-        when(staffRepo.save(any(Staff.class))).thenAnswer(inv -> {
+        when(staffRepo.saveAndFlush(any(Staff.class))).thenAnswer(inv -> {
             Staff s = inv.getArgument(0);
             if (s.getId() == null) {
                 s.setId(100L);
             }
             return s;
         });
-        when(userRepo.save(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(userRepo.saveAndFlush(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
         when(staffRepo.maxSortOrder()).thenReturn(0);
 
         service = new StaffService(staffRepo, userRepo, encoder, opLog, CLOCK);
@@ -103,7 +107,7 @@ class StaffServiceTest {
         CreateStaffResult result = service.create(request("IT001", "张三", "工程师", "13800000000", true, Role.MEMBER));
 
         ArgumentCaptor<Staff> savedStaff = ArgumentCaptor.forClass(Staff.class);
-        verify(staffRepo).save(savedStaff.capture());
+        verify(staffRepo).saveAndFlush(savedStaff.capture());
         Staff staff = savedStaff.getValue();
         assertEquals("IT001", staff.getEmpNo());
         assertEquals("张三", staff.getName());
@@ -114,7 +118,7 @@ class StaffServiceTest {
         assertEquals(NOW, staff.getUpdatedAt());
 
         ArgumentCaptor<AppUser> savedUser = ArgumentCaptor.forClass(AppUser.class);
-        verify(userRepo).save(savedUser.capture());
+        verify(userRepo).saveAndFlush(savedUser.capture());
         AppUser user = savedUser.getValue();
         assertEquals("IT001", user.getUsername());
         assertEquals("张三", user.getDisplayName());
@@ -142,8 +146,8 @@ class StaffServiceTest {
         assertEquals(1201, bizCode(() -> service.create(
                 request("IT001", "张三", null, null, true, Role.MEMBER))));
 
-        verify(staffRepo, never()).save(any(Staff.class));
-        verify(userRepo, never()).save(any(AppUser.class));
+        verify(staffRepo, never()).saveAndFlush(any(Staff.class));
+        verify(userRepo, never()).saveAndFlush(any(AppUser.class));
     }
 
     /** 工号没占用但用户名被账号占了（例如 admin），同样是 1201 */
@@ -154,7 +158,7 @@ class StaffServiceTest {
         assertEquals(1201, bizCode(() -> service.create(
                 request("admin", "张三", null, null, true, Role.ADMIN))));
 
-        verify(staffRepo, never()).save(any(Staff.class));
+        verify(staffRepo, never()).saveAndFlush(any(Staff.class));
     }
 
     @Test
@@ -162,8 +166,59 @@ class StaffServiceTest {
         assertEquals(1202, bizCode(() -> service.create(
                 request("IT002", "李四", null, null, true, Role.SCREEN))));
 
-        verify(staffRepo, never()).save(any(Staff.class));
-        verify(userRepo, never()).save(any(AppUser.class));
+        verify(staffRepo, never()).saveAndFlush(any(Staff.class));
+        verify(userRepo, never()).saveAndFlush(any(AppUser.class));
+    }
+
+    /**
+     * 并发回归：两个管理员同时提交同一工号，exists 预检查都返回 false，冲突到 insert 才暴露。
+     * 此时 emp_no 上的唯一索引（SQLState 23505）必须转成 1201，不能漏到全局处理器变成 500。
+     */
+    @Test
+    void createRacesOnEmpNoUniqueIndexReturns1201() {
+        when(staffRepo.saveAndFlush(any(Staff.class)))
+                .thenThrow(duplicate("staff_emp_no_key", "23505"));
+
+        assertEquals(1201, bizCode(() -> service.create(
+                request("IT001", "张三", null, null, true, Role.MEMBER))));
+
+        // 人员没插进去，账号也不能建，留痕同样不能记
+        verify(userRepo, never()).saveAndFlush(any(AppUser.class));
+        verify(opLog, never()).record(anyString(), anyString(), any());
+    }
+
+    /** 并发回归：撞上的是 app_user.username 唯一索引（工号新、用户名已被占），同样要回 1201 */
+    @Test
+    void createRacesOnUsernameUniqueIndexReturns1201() {
+        when(userRepo.saveAndFlush(any(AppUser.class)))
+                .thenThrow(duplicate("app_user_username_key", "23505"));
+
+        assertEquals(1201, bizCode(() -> service.create(
+                request("IT001", "张三", null, null, true, Role.MEMBER))));
+
+        verify(opLog, never()).record(anyString(), anyString(), any());
+    }
+
+    /** 不是唯一键的完整性故障（23502 非空）不能冒充重复工号，要原样抛出让事务回滚、接口报 500 */
+    @Test
+    void createRethrowsOtherIntegrityFailure() {
+        when(userRepo.saveAndFlush(any(AppUser.class)))
+                .thenThrow(new DataIntegrityViolationException(
+                        "null value in column \"display_name\" violates not-null constraint",
+                        new SQLException("null value in column \"display_name\" violates not-null constraint", "23502")));
+
+        assertThrows(DataIntegrityViolationException.class,
+                () -> service.create(request("IT001", "张三", null, null, true, Role.MEMBER)));
+
+        verify(opLog, never()).record(anyString(), anyString(), any());
+    }
+
+    /** 造一个与 PostgreSQL 唯一键冲突同形的异常链（Spring 转译后的 DuplicateKeyException 包 SQLException 23505） */
+    private static DataIntegrityViolationException duplicate(String constraint, String sqlState) {
+        SQLException sqlException = new SQLException(
+                "duplicate key value violates unique constraint \"" + constraint + "\"", sqlState);
+        return new DuplicateKeyException(
+                "could not execute statement [" + constraint + "]", sqlException);
     }
 
     @Test
@@ -171,7 +226,7 @@ class StaffServiceTest {
         service.create(request("IT003", "王五", "", "", false, Role.MEMBER));
 
         ArgumentCaptor<Staff> saved = ArgumentCaptor.forClass(Staff.class);
-        verify(staffRepo).save(saved.capture());
+        verify(staffRepo).saveAndFlush(saved.capture());
         assertNull(saved.getValue().getPosition());
         assertNull(saved.getValue().getPhone());
         assertFalse(saved.getValue().isSchedulable());
