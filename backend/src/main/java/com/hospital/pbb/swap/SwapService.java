@@ -1,10 +1,13 @@
 package com.hospital.pbb.swap;
 
+import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.ScheduleQueryService;
 import com.hospital.pbb.schedule.ScheduleService;
 import com.hospital.pbb.staff.Staff;
 import com.hospital.pbb.staff.StaffRepository;
+import com.hospital.pbb.swap.dto.CreateSwapRequest;
 import com.hospital.pbb.swap.dto.SwapVO;
 import com.hospital.pbb.user.AuthUser;
 import com.hospital.pbb.user.Role;
@@ -12,13 +15,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 调班申请（设计 §5.3，任务单 M3-03 只做列表）。
+ * 调班申请（设计 §5.3，任务单 M3-03 列表、M3-04 发起）。
  *
  * <p>同一条记录在不同人眼里的可见范围不一样：科长看得到全科的，成员只关心
  * “我发起的”和“对方是我”的，所以三个 scope 各自走一条仓库查询，而不是查全量再在内存里过滤。</p>
@@ -32,7 +36,7 @@ public class SwapService {
     private final SwapRequestRepository repo;
     private final StaffRepository staffRepo;
     private final ScheduleQueryService query;
-    // 下面三项本单用不到：M3-04 发起、M3-05 确认/撤销/审批要回写排班并留痕，先注入好直接拿来用
+    // schedule 本单用不到：M3-05 确认/撤销/审批要回写排班，先注入好直接拿来用
     private final ScheduleService schedule;
     private final OpLogService opLog;
     private final Clock clock;
@@ -45,6 +49,103 @@ public class SwapService {
         this.schedule = schedule;
         this.opLog = opLog;
         this.clock = clock;
+    }
+
+    /**
+     * 发起调班申请（任务单 M3-04）。
+     *
+     * <p>校验按“先便宜后贵”的顺序排：先账号、日期这类不查库的判断，再查对方人员，
+     * 然后才是几次要发布快照的查询，最后查有没有进行中的申请，先失败先返回。</p>
+     *
+     * <p>请假没有对方，跳过全部对方校验直接进科长审批；换班要两头四天都有已发布班次才允许互换。</p>
+     *
+     * @param req 请求体
+     * @param me  当前登录账号，申请人取 {@code me.staffId()}
+     * @return 保存后的申请
+     * @throws BizException 1601 账号未关联人员、1602 没有已发布的班次、1603 日期早于今天、
+     *                      1604 对方是自己、1605 对方人员无效、1606 缺少对方人员或日期、
+     *                      1607 该日期已有进行中的申请
+     */
+    @Transactional
+    public SwapVO create(CreateSwapRequest req, AuthUser me) {
+        Long staffId = me.staffId();
+        if (staffId == null) {
+            throw new BizException(1601, "当前账号未关联人员，不能申请调班");
+        }
+        LocalDate today = LocalDate.now(clock);
+        LocalDate applicantDate = req.applicantDate();
+        if (applicantDate.isBefore(today)) {
+            throw new BizException(1603, "只能申请今天及以后的日期");
+        }
+        SwapType type = req.type();
+
+        // LEAVE 不存在“对方”，前端就算传了也一律丢弃，避免留下一条永远确认不了的记录
+        Long targetStaffId = type == SwapType.LEAVE ? null : req.targetStaffId();
+        LocalDate targetDate = type == SwapType.LEAVE ? null : req.targetDate();
+        if (type != SwapType.LEAVE) {
+            if (targetStaffId == null) {
+                throw new BizException(1606, "请选择对方人员");
+            }
+            if (targetStaffId.equals(staffId)) {
+                throw new BizException(1604, "对方不能是自己");
+            }
+            requireTargetStaff(targetStaffId);
+            if (type == SwapType.SWAP) {
+                // 换班是两格换两格，缺对方日期就不知道换到哪一天；替班只要对方来上本人那天，targetDate 保持 null
+                if (targetDate == null) {
+                    throw new BizException(1606, "换班必须选择对方日期");
+                }
+                if (targetDate.isBefore(today)) {
+                    throw new BizException(1603, "只能申请今天及以后的日期");
+                }
+            } else {
+                targetDate = null;
+            }
+        }
+
+        requirePublished(staffId, applicantDate, "该日期没有已发布的班次");
+        if (type == SwapType.SWAP) {
+            // 缺任何一格，审批时都换不成：本人那天换给对方后，对方那天得有条理地换给本人
+            requirePublished(staffId, targetDate, "对方日期没有已发布的班次");
+            requirePublished(targetStaffId, applicantDate, "对方日期没有已发布的班次");
+            requirePublished(targetStaffId, targetDate, "对方日期没有已发布的班次");
+        } else if (type == SwapType.COVER) {
+            requirePublished(targetStaffId, applicantDate, "对方日期没有已发布的班次");
+        }
+
+        if (repo.existsByApplicantStaffIdAndApplicantDateAndStatusIn(staffId, applicantDate,
+                List.of(SwapStatus.PENDING_PEER, SwapStatus.PENDING_ADMIN))) {
+            throw new BizException(1607, "该日期已有进行中的申请");
+        }
+
+        SwapRequest request = new SwapRequest();
+        request.setType(type);
+        request.setApplicantStaffId(staffId);
+        request.setApplicantDate(applicantDate);
+        request.setTargetStaffId(targetStaffId);
+        request.setTargetDate(targetDate);
+        request.setReason(blankToNull(req.reason()));
+        // 请假不需要对方点头，直接进科长审批；换班、替班先等对方确认
+        request.setStatus(type == SwapType.LEAVE ? SwapStatus.PENDING_ADMIN : SwapStatus.PENDING_PEER);
+        SwapRequest saved = repo.save(request);
+
+        opLog.record(OpAction.CREATE_SWAP, noOf(saved.getId()), type + " " + applicantDate);
+        return toVO(saved, me, staffById());
+    }
+
+    /** 对方人员必须存在且还在排班，停用了或不排班的人换不了班。 */
+    private void requireTargetStaff(Long targetStaffId) {
+        Staff target = staffRepo.findById(targetStaffId).orElse(null);
+        if (target == null || !target.isActive() || !target.isSchedulable()) {
+            throw new BizException(1605, "对方人员不存在或不参与排班");
+        }
+    }
+
+    /** 那一天必须有已发布班次，草稿不算——成员看到的才是他想换的那个班。 */
+    private void requirePublished(Long staffId, LocalDate date, String message) {
+        if (query.publishedShift(staffId, date).isEmpty()) {
+            throw new BizException(1602, message);
+        }
     }
 
     /**
@@ -136,6 +237,11 @@ public class SwapService {
     private static String nameOf(Map<Long, Staff> staffById, Long staffId) {
         Staff staff = staffId == null ? null : staffById.get(staffId);
         return staff == null ? null : staff.getName();
+    }
+
+    /** 理由全空格与不填没有区别，存 null，列表上不会显示一串空白。 */
+    private static String blankToNull(String reason) {
+        return reason == null || reason.isBlank() ? null : reason;
     }
 
     /** 单据号：TB-0003。 */
