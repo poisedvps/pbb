@@ -4,6 +4,7 @@ import com.hospital.pbb.common.ApiResponse;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
+import com.hospital.pbb.schedule.dto.PublishResultVO;
 import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
 import com.hospital.pbb.user.AuthUser;
 import com.hospital.pbb.user.Role;
@@ -57,5 +58,12 @@ public class ScheduleController {
     public ApiResponse<CellVO> updateEntry(@PathVariable String yearMonth, @Valid @RequestBody UpdateEntryRequest req,
                                            @AuthenticationPrincipal AuthUser me) {
         return ApiResponse.ok(scheduleService.updateEntry(yearMonth, req, me.id()));
+    }
+
+    /** 发布整月排班：把当前草稿整体复制成已发布快照，成员与大屏随之看到新版本 */
+    @PostMapping("/{yearMonth}/publish")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ApiResponse<PublishResultVO> publish(@PathVariable String yearMonth, @AuthenticationPrincipal AuthUser me) {
+        return ApiResponse.ok(scheduleService.publish(yearMonth, me.id()));
     }
 }
