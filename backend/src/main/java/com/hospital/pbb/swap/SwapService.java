@@ -12,6 +12,9 @@ import com.hospital.pbb.swap.dto.CreateSwapRequest;
 import com.hospital.pbb.swap.dto.SwapVO;
 import com.hospital.pbb.user.AuthUser;
 import com.hospital.pbb.user.Role;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.Query;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -28,6 +31,11 @@ import java.util.Map;
  *
  * <p>同一条记录在不同人眼里的可见范围不一样：科长看得到全科的，成员只关心
  * “我发起的”和“对方是我”的，所以三个 scope 各自走一条仓库查询，而不是查全量再在内存里过滤。</p>
+ *
+ * <p>确认 / 拒绝 / 撤销 / 审批这五个动作是状态机转换，走的是同一套口径：先用
+ * {@code SELECT ... FOR UPDATE} 锁住这一行读（{@link #loadForUpdate}），再用带旧状态的条件更新落库
+ * （{@link #transition}）。同一张单子被两个人同时点开时，后到的堵到前一个提交，读的是提交后的新状态，
+ * 只能拿 1608，不会两个都成功、把排班回写两遍。</p>
  */
 @Service
 public class SwapService {
@@ -44,18 +52,21 @@ public class SwapService {
     private final SwapRequestRepository repo;
     private final StaffRepository staffRepo;
     private final ScheduleQueryService query;
-    // schedule 本单用不到：M3-05 确认/撤销/审批要回写排班，先注入好直接拿来用
+    // M3-05 审批通过后由它把结果写回排班（同一个事务，回写和状态转换一起成败）
     private final ScheduleService schedule;
     private final OpLogService opLog;
+    // 取行锁 + 带旧状态的条件更新，仓库接口里没有这两个能力，直接用 EntityManager
+    private final EntityManager em;
     private final Clock clock;
 
     public SwapService(SwapRequestRepository repo, StaffRepository staffRepo, ScheduleQueryService query,
-                       ScheduleService schedule, OpLogService opLog, Clock clock) {
+                       ScheduleService schedule, OpLogService opLog, EntityManager em, Clock clock) {
         this.repo = repo;
         this.staffRepo = staffRepo;
         this.query = query;
         this.schedule = schedule;
         this.opLog = opLog;
+        this.em = em;
         this.clock = clock;
     }
 
@@ -170,9 +181,8 @@ public class SwapService {
     @Transactional
     public SwapVO confirm(Long id, AuthUser me) {
         SwapRequest request = loadPendingPeer(id, me);
-        request.setStatus(SwapStatus.PENDING_ADMIN);
-        request.setPeerConfirmedAt(OffsetDateTime.now(clock));
-        return saveAndLog(request, me, OpAction.CONFIRM_SWAP, null);
+        return logAndReturn(transition(request, SwapStatus.PENDING_PEER, SwapStatus.PENDING_ADMIN,
+                OffsetDateTime.now(clock), null, null), me, OpAction.CONFIRM_SWAP, null);
     }
 
     /**
@@ -188,8 +198,9 @@ public class SwapService {
     @Transactional
     public SwapVO rejectPeer(Long id, AuthUser me) {
         SwapRequest request = loadPendingPeer(id, me);
-        request.setStatus(SwapStatus.REJECTED);
-        return saveAndLog(request, me, OpAction.REJECT_SWAP_PEER, null);
+        // 这一列本来就没值，原样回写，让条件更新不要顺手把它清空
+        return logAndReturn(transition(request, SwapStatus.PENDING_PEER, SwapStatus.REJECTED,
+                request.getPeerConfirmedAt(), null, null), me, OpAction.REJECT_SWAP_PEER, null);
     }
 
     /**
@@ -205,16 +216,18 @@ public class SwapService {
      */
     @Transactional
     public SwapVO cancel(Long id, AuthUser me) {
-        SwapRequest request = load(id);
-        if (request.getStatus() != SwapStatus.PENDING_PEER && request.getStatus() != SwapStatus.PENDING_ADMIN) {
+        SwapRequest request = loadForUpdate(id);
+        SwapStatus from = request.getStatus();
+        if (from != SwapStatus.PENDING_PEER && from != SwapStatus.PENDING_ADMIN) {
             throw new BizException(1608, "当前状态不允许此操作");
         }
         if (!sameStaff(me.staffId(), request.getApplicantStaffId())) {
             // 对方只负责点头或拒绝，撤销是申请人的权利，不能替他撤
             throw new BizException(1609, "无权操作该申请");
         }
-        request.setStatus(SwapStatus.CANCELLED);
-        return saveAndLog(request, me, OpAction.CANCEL_SWAP, null);
+        // 对方已经点过头的话这个时间要留着，撤销不该把「对方哪天答应的」一起摸掉
+        return logAndReturn(transition(request, from, SwapStatus.CANCELLED,
+                request.getPeerConfirmedAt(), null, null), me, OpAction.CANCEL_SWAP, null);
     }
 
     /**
@@ -222,8 +235,8 @@ public class SwapService {
      *
      * <p>要改的格子按<b>审批时</b>的已发布班次现算，不取发起时存下的快照：从发起到科长点通过
      * 中间可能过了几天，排班可能已被科长改过，按旧值算会把人排到不存在的班上去。
-     * 算不出完整格子（任意一格已无已发布）就直接 1602 报错，事务回滚，
-     * 绝不先改一半排班再把申请标成通过。</p>
+     * 要写的每一格（请假的本人那格、替班的对方那格、换班的四格）都得还有已发布快照，
+     * 缺任意一格就 1602 报错，而且卡在第一次写之前——绝不先改一半排班再把申请标成通过。</p>
      *
      * @param id      申请 id
      * @param comment 审批意见，可空
@@ -234,12 +247,12 @@ public class SwapService {
     @Transactional
     public SwapVO approve(Long id, String comment, AuthUser me) {
         SwapRequest request = loadPendingAdmin(id);
+        // 先把格子算齐再动任何东西：算不出来（1602）和状态被抢走（1608）都落在第一次写之前
         List<CellChange> changes = changesOf(request);
+        transition(request, SwapStatus.PENDING_ADMIN, SwapStatus.APPROVED,
+                request.getPeerConfirmedAt(), me, comment);
         schedule.applyChanges(changes, "调班 " + noOf(request.getId()), me.id());
-
-        request.setStatus(SwapStatus.APPROVED);
-        markReviewed(request, comment, me);
-        return saveAndLog(request, me, OpAction.APPROVE_SWAP, "回写" + changes.size() + "格");
+        return logAndReturn(request, me, OpAction.APPROVE_SWAP, "回写" + changes.size() + "格");
     }
 
     /**
@@ -257,19 +270,29 @@ public class SwapService {
     @Transactional
     public SwapVO reject(Long id, String comment, AuthUser me) {
         SwapRequest request = loadPendingAdmin(id);
-        request.setStatus(SwapStatus.REJECTED);
-        markReviewed(request, comment, me);
-        return saveAndLog(request, me, OpAction.REJECT_SWAP, null);
+        return logAndReturn(transition(request, SwapStatus.PENDING_ADMIN, SwapStatus.REJECTED,
+                request.getPeerConfirmedAt(), me, comment), me, OpAction.REJECT_SWAP, null);
     }
 
-    /** 按 id 取申请，查不到就是已经没了，1600。 */
-    private SwapRequest load(Long id) {
-        return repo.findById(id).orElseThrow(() -> new BizException(1600, "调班申请不存在"));
+    /**
+     * 按 id 取申请，并锁住这一行；查不到就是已经没了，1600。
+     *
+     * <p>{@code SELECT ... FOR UPDATE} 是这条流程的串行化点：锁只落在这一条申请、一行上（不涉排班表），
+     * 但同一条申请被两个人同时点开——两个科长各点一次通过，或者申请人一边撤销、对方一边点头——后到的
+     * 那个会在这里堵到前一个事务提交为止，往下读的是提交后的新状态，不是自己那份旧快照，
+     * 于是它只能拿到 1608。</p>
+     */
+    private SwapRequest loadForUpdate(Long id) {
+        SwapRequest request = em.find(SwapRequest.class, id, LockModeType.PESSIMISTIC_WRITE);
+        if (request == null) {
+            throw new BizException(1600, "调班申请不存在");
+        }
+        return request;
     }
 
     /** 对方确认/拒绝的入口条件：还在等对方点头，而且当前登录人就是那个“对方”。 */
     private SwapRequest loadPendingPeer(Long id, AuthUser me) {
-        SwapRequest request = load(id);
+        SwapRequest request = loadForUpdate(id);
         if (request.getStatus() != SwapStatus.PENDING_PEER) {
             throw new BizException(1608, "当前状态不允许此操作");
         }
@@ -286,9 +309,59 @@ public class SwapService {
      * 至于是不是科长——已由 Controller 的 {@code @PreAuthorize} 拦在前面。</p>
      */
     private SwapRequest loadPendingAdmin(Long id) {
-        SwapRequest request = load(id);
+        SwapRequest request = loadForUpdate(id);
         if (request.getStatus() != SwapStatus.PENDING_ADMIN) {
             throw new BizException(1608, "当前状态不允许此操作");
+        }
+        return request;
+    }
+
+    /**
+     * 状态转换的唯一出口：{@code update ... set ... where id = ? and status = ?}，带旧状态的条件更新。
+     *
+     * <p>{@link #loadForUpdate} 已经把同一条申请串起来了，这里是第二道防线：万一以后有别的入口不取锁
+     * 就改这条记录，也不会有两个人都把自己那次改成功。更新 0 行 = 读到的状态在写之前已经不成立，本次
+     * 操作作废（1608）；调用方都把这一步放在回写排班之前，所以作废时排班一格都没动。</p>
+     *
+     * <p>转换走 JPQL 而不是改托管实体，是为了让「写状态」带得上 {@code where status = 旧值}；写完实体
+     * 已经陈旧，先脱离托管再把手上的值同步成刚写进去的，只给返回的 VO 用，免得事务提交时 Hibernate
+     * 拿读进来的旧状态把结果盖回去。</p>
+     *
+     * @param from            期望的当前状态，写进 WHERE
+     * @param to              要转成的状态
+     * @param peerConfirmedAt 对方确认时间；不碰这一列的转换传它原来的值，条件更新不能顺手清掉已有留痕
+     * @param reviewer        审批人（账号），只有 approve/reject 传，其余传 null
+     * @param comment         审批意见，全空格与不填一样存 null
+     */
+    private SwapRequest transition(SwapRequest request, SwapStatus from, SwapStatus to,
+                                   OffsetDateTime peerConfirmedAt, AuthUser reviewer, String comment) {
+        OffsetDateTime reviewedAt = reviewer == null ? null : OffsetDateTime.now(clock);
+        String reviewComment = reviewer == null ? null : blankToNull(comment);
+        // 这条更新语句用不带结果类的 createQuery：Hibernate 6 不允许给 update 语句指结果类型
+        Query update = em.createQuery(
+                "update SwapRequest r set r.status = :to, r.peerConfirmedAt = :peerConfirmedAt"
+                        + (reviewer == null ? "" : ", r.reviewedBy = :reviewedBy, r.reviewedAt = :reviewedAt,"
+                        + " r.reviewComment = :reviewComment")
+                        + " where r.id = :id and r.status = :from")
+                .setParameter("to", to)
+                .setParameter("peerConfirmedAt", peerConfirmedAt)
+                .setParameter("id", request.getId())
+                .setParameter("from", from);
+        if (reviewer != null) {
+            update.setParameter("reviewedBy", reviewer.id()).setParameter("reviewedAt", reviewedAt)
+                    .setParameter("reviewComment", reviewComment);
+        }
+        if (update.executeUpdate() == 0) {
+            throw new BizException(1608, "当前状态不允许此操作");
+        }
+        em.detach(request);
+        request.setStatus(to);
+        request.setPeerConfirmedAt(peerConfirmedAt);
+        if (reviewer != null) {
+            // 审批留痕：审批人取账号 id（不是人员 id）
+            request.setReviewedBy(reviewer.id());
+            request.setReviewedAt(reviewedAt);
+            request.setReviewComment(reviewComment);
         }
         return request;
     }
@@ -306,10 +379,17 @@ public class SwapService {
         LocalDate applicantDate = request.getApplicantDate();
         List<CellChange> changes = new ArrayList<>();
         switch (request.getType()) {
-            case LEAVE -> changes.add(new CellChange(applicantStaffId, applicantDate, SHIFT_LEAVE));
+            case LEAVE -> {
+                // 要写的就这一格，它必须还有已发布快照，否则 L 只落在草稿上，成员的月视图不会变
+                requireShift(applicantStaffId, applicantDate);
+                changes.add(new CellChange(applicantStaffId, applicantDate, SHIFT_LEAVE));
+            }
             case COVER -> {
                 // 对方来上本人那个班，本人自己改成休息（不是 L：他是“不用上了”，不是请假）
                 String original = shiftOf(applicantStaffId, applicantDate);
+                // 对方那格也得还在：applyChanges 只更新已有的已发布快照，缺了就是申请 APPROVED、
+                // 成员却看不到有人来接班
+                requireShift(request.getTargetStaffId(), applicantDate);
                 changes.add(new CellChange(request.getTargetStaffId(), applicantDate, original));
                 changes.add(new CellChange(applicantStaffId, applicantDate, SHIFT_REST));
             }
@@ -339,24 +419,22 @@ public class SwapService {
                 .orElseThrow(() -> new BizException(1602, "排班已变化，请驳回后重新申请"));
     }
 
-    /** 审批留痕：审批人取账号 id（不是人员 id），意见全空格与不填一样存 null。 */
-    private void markReviewed(SwapRequest request, String comment, AuthUser me) {
-        request.setReviewedBy(me.id());
-        request.setReviewedAt(OffsetDateTime.now(clock));
-        request.setReviewComment(blankToNull(comment));
+    /** 只要这一格还有已发布快照，值用不上（要写的是固定的 L / X）。 */
+    private void requireShift(Long staffId, LocalDate date) {
+        shiftOf(staffId, date);
     }
 
     /**
-     * 入库 + 留痕 + 转 VO，五个流程方法共同的尾巴。
+     * 留痕 + 转 VO，五个流程方法共同的尾巴。
      *
-     * <p>操作日志 target 一律是单据号 {@code TB-xxxx}，detail 带上类型和本人那天，
+     * <p>状态已由 {@link #transition} 的条件更新写进库，这里不再 save 一次——那会把这个陈旧实体上的
+     * 其它列一起盖回去。操作日志 target 一律是单据号 {@code TB-xxxx}，detail 带上类型和本人那天，
      * 免得日志里十几条“同意调班”分不清是哪一笔；{@code extra} 只给审批通过补上回写格数。</p>
      */
-    private SwapVO saveAndLog(SwapRequest request, AuthUser me, String action, String extra) {
-        SwapRequest saved = repo.save(request);
-        String detail = saved.getType() + " " + saved.getApplicantDate();
-        opLog.record(action, noOf(saved.getId()), extra == null ? detail : detail + "，" + extra);
-        return toVO(saved, me, staffById());
+    private SwapVO logAndReturn(SwapRequest request, AuthUser me, String action, String extra) {
+        String detail = request.getType() + " " + request.getApplicantDate();
+        opLog.record(action, noOf(request.getId()), extra == null ? detail : detail + "，" + extra);
+        return toVO(request, me, staffById());
     }
 
     /**

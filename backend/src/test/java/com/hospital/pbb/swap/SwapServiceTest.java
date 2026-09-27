@@ -12,6 +12,9 @@ import com.hospital.pbb.swap.dto.CreateSwapRequest;
 import com.hospital.pbb.swap.dto.SwapVO;
 import com.hospital.pbb.user.AuthUser;
 import com.hospital.pbb.user.Role;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.Query;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -21,8 +24,18 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -31,9 +44,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -61,6 +76,7 @@ class SwapServiceTest {
     private SwapRequestRepository repo;
     private StaffRepository staffRepo;
     private ScheduleQueryService query;
+    private EntityManager em;
     private SwapService service;
 
     @BeforeEach
@@ -68,8 +84,9 @@ class SwapServiceTest {
         repo = mock(SwapRequestRepository.class);
         staffRepo = mock(StaffRepository.class);
         query = mock(ScheduleQueryService.class);
+        em = mock(EntityManager.class);
         service = new SwapService(repo, staffRepo, query, mock(ScheduleService.class),
-                mock(OpLogService.class), Clock.fixed(Instant.parse("2026-10-08T01:00:00Z"), ZoneOffset.UTC));
+                mock(OpLogService.class), em, Clock.fixed(Instant.parse("2026-10-08T01:00:00Z"), ZoneOffset.UTC));
 
         // 默认：人员表里只有张三、李四；所有格子都查不到已发布班次
         when(staffRepo.findAll()).thenReturn(List.of(staff(1L, "张三"), staff(2L, "李四")));
@@ -312,7 +329,7 @@ class SwapServiceTest {
      */
     private SwapService createService() {
         opLog = mock(OpLogService.class);
-        return new SwapService(repo, staffRepo, query, mock(ScheduleService.class), opLog,
+        return new SwapService(repo, staffRepo, query, mock(ScheduleService.class), opLog, em,
                 Clock.fixed(Instant.parse("2026-10-09T01:00:00Z"), ZoneOffset.UTC));
     }
 
@@ -582,19 +599,83 @@ class SwapServiceTest {
     private ScheduleService schedule;
 
     /**
+     * 假库里的 {@code swap_request}：id → 那一行。流程方法读的是这行的副本（两个事务各拿一份一级缓存），
+     * 写只能通过那条条件更新写回这行，所以并发两个线程跑同一个 id 也能得到真库那样的结果。
+     */
+    private final Map<Long, SwapRequest> table = new HashMap<>();
+
+    /** 取行锁时要不要等一下另一个人（并发用例用它把两个线程卡在同一条起跑线上） */
+    private CyclicBarrier lockBarrier;
+
+    /**
      * 流程用例专用的 service：Clock 固定 2026-10-09，{@link ScheduleService} 与
      * {@link OpLogService} 各给一个 mock，前者验回写参数、后者验留痕，仓库与人员表沿用 setUp 的打桩。
      */
     private SwapService reviewService() {
         opLog = mock(OpLogService.class);
         schedule = mock(ScheduleService.class);
-        return new SwapService(repo, staffRepo, query, schedule, opLog,
+        stubConditionalUpdate();
+        return new SwapService(repo, staffRepo, query, schedule, opLog, em,
                 Clock.fixed(Instant.parse("2026-10-09T01:00:00Z"), ZoneOffset.UTC));
     }
 
     /**
+     * {@code SwapService.transition} 那条 {@code update ... where id = ? and status = ?} 的仿制品：
+     * 真库的语义就是旧状态还在才能改中，否则影行数 0。参数按线程存（一个线程 = 一个事务），
+     * 行上的判断加锁，跟 Postgres 行锁一样串行。
+     */
+    private void stubConditionalUpdate() {
+        Query update = mock(Query.class);
+        ThreadLocal<Map<String, Object>> bound = ThreadLocal.withInitial(HashMap::new);
+        // 每次 createQuery = 一个新查询对象，绑定参数从零开始（别漏到下一个事务里）
+        when(em.createQuery(anyString())).thenAnswer(invocation -> {
+            bound.get().clear();
+            return update;
+        });
+        when(update.setParameter(anyString(), any())).thenAnswer(invocation -> {
+            bound.get().put(invocation.getArgument(0), invocation.getArgument(1));
+            return update;
+        });
+        when(update.executeUpdate()).thenAnswer(invocation -> {
+            Map<String, Object> params = bound.get();
+            SwapRequest row = table.get((Long) params.get("id"));
+            synchronized (row) {
+                if (row.getStatus() != params.get("from")) {
+                    return 0;
+                }
+                row.setStatus((SwapStatus) params.get("to"));
+                row.setPeerConfirmedAt((OffsetDateTime) params.get("peerConfirmedAt"));
+                if (params.get("reviewedBy") != null) {
+                    row.setReviewedBy((Long) params.get("reviewedBy"));
+                    row.setReviewedAt((OffsetDateTime) params.get("reviewedAt"));
+                    row.setReviewComment((String) params.get("reviewComment"));
+                }
+                return 1;
+            }
+        });
+    }
+
+    /** 一次读到的是一份独立副本，模拟事务之间看不见的实体。 */
+    private static SwapRequest copyOf(SwapRequest source) {
+        SwapRequest copy = new SwapRequest();
+        copy.setId(source.getId());
+        copy.setType(source.getType());
+        copy.setStatus(source.getStatus());
+        copy.setApplicantStaffId(source.getApplicantStaffId());
+        copy.setApplicantDate(source.getApplicantDate());
+        copy.setTargetStaffId(source.getTargetStaffId());
+        copy.setTargetDate(source.getTargetDate());
+        copy.setReason(source.getReason());
+        copy.setPeerConfirmedAt(source.getPeerConfirmedAt());
+        copy.setReviewedBy(source.getReviewedBy());
+        copy.setReviewedAt(source.getReviewedAt());
+        copy.setReviewComment(source.getReviewComment());
+        return copy;
+    }
+
+    /**
      * 一条张三（staffId=1）10-12 的申请，LEAVE 没有对方，其余类型对方都是李四（staffId=2）。
-     * 直接返回实体本身，方便用例断言字段是被改在这条记录上（save 打桩原样返回入参）。
+     * 返回假库里那一行，用例断言的正是“行上的字段到底最后变成了什么”。
      */
     private SwapRequest stubFound(Long id, SwapType type, SwapStatus status, LocalDate targetDate) {
         SwapRequest request = new SwapRequest();
@@ -606,9 +687,24 @@ class SwapServiceTest {
         request.setTargetStaffId(type == SwapType.LEAVE ? null : 2L);
         request.setTargetDate(targetDate);
         request.setReason("家里有事");
-        when(repo.findById(id)).thenReturn(Optional.of(request));
-        when(repo.save(any(SwapRequest.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        table.put(id, request);
+        when(em.find(SwapRequest.class, id, LockModeType.PESSIMISTIC_WRITE)).thenAnswer(invocation -> {
+            SwapRequest copy;
+            synchronized (request) {
+                copy = copyOf(request);
+            }
+            if (lockBarrier != null) {
+                // 并发用例：两个线程都先拿到锁、都读到旧状态，再一起往下跑
+                lockBarrier.await(10, TimeUnit.SECONDS);
+            }
+            return copy;
+        });
         return request;
+    }
+
+    /** 一行都没写过（任何一条条件更新都没发出）。 */
+    private void verifyNoTransition() {
+        verify(em, never()).createQuery(anyString());
     }
 
     /** 捕获回写给排班的 changes。 */
@@ -657,7 +753,7 @@ class SwapServiceTest {
         assertEquals(1609, assertThrows(BizException.class, () -> review.confirm(7L, ADMIN)).getCode());
 
         assertEquals(SwapStatus.PENDING_PEER, request.getStatus());
-        verify(repo, never()).save(any());
+        verifyNoTransition();
     }
 
     /** 已经批完/驳回/撤销的记录，对方再确认就是流程错了 → 1608。 */
@@ -670,7 +766,7 @@ class SwapServiceTest {
 
         assertEquals(1608, e.getCode());
         assertEquals("当前状态不允许此操作", e.getMessage());
-        verify(repo, never()).save(any());
+        verifyNoTransition();
     }
 
     @Test
@@ -719,7 +815,7 @@ class SwapServiceTest {
         assertEquals(1608, e.getCode());
         assertEquals("当前状态不允许此操作", e.getMessage());
         assertEquals(SwapStatus.APPROVED, request.getStatus());
-        verify(repo, never()).save(any());
+        verifyNoTransition();
     }
 
     /** 撤销是申请人的权利，对方（哪怕是待确认状态）不能替他撤。 */
@@ -734,7 +830,7 @@ class SwapServiceTest {
         assertEquals("无权操作该申请", e.getMessage());
         assertEquals(1609, assertThrows(BizException.class, () -> review.cancel(7L, WANG)).getCode());
         assertEquals(SwapStatus.PENDING_PEER, request.getStatus());
-        verify(repo, never()).save(any());
+        verifyNoTransition();
     }
 
     // ---------- 科长驳回 ----------
@@ -779,7 +875,7 @@ class SwapServiceTest {
         assertEquals(1608, assertThrows(BizException.class, () -> review.reject(7L, null, ADMIN)).getCode());
         assertEquals(SwapStatus.PENDING_PEER, request.getStatus());
         verifyNoInteractions(schedule);
-        verify(repo, never()).save(any());
+        verifyNoTransition();
     }
 
     // ---------- 科长审批通过：回写口径 ----------
@@ -808,6 +904,8 @@ class SwapServiceTest {
         SwapService review = reviewService();
         SwapRequest request = stubFound(7L, SwapType.COVER, SwapStatus.PENDING_ADMIN, null);
         when(query.publishedShift(1L, LEAVE_DAY)).thenReturn(Optional.of("N"));
+        // 替班要写两格，对方那格也得有已发布班次
+        when(query.publishedShift(2L, LEAVE_DAY)).thenReturn(Optional.of("D"));
 
         review.approve(7L, null, ADMIN);
 
@@ -868,20 +966,154 @@ class SwapServiceTest {
         assertEquals(1602, e.getCode());
         assertEquals("排班已变化，请驳回后重新申请", e.getMessage());
         verify(schedule, never()).applyChanges(any(), any(), any());
-        verify(repo, never()).save(any());
+        verifyNoTransition();
         assertEquals(SwapStatus.PENDING_ADMIN, request.getStatus());
     }
 
-    /** 替班时本人的班被改没了，同样不能回写。 */
+    /**
+     * 替班时本人的班被改没了，同样不能回写。
+     */
     @Test
     void approveCoverWhenOwnShiftGoneWritesNothing() {
         SwapService review = reviewService();
-        stubFound(7L, SwapType.COVER, SwapStatus.PENDING_ADMIN, null);
+        SwapRequest row = stubFound(7L, SwapType.COVER, SwapStatus.PENDING_ADMIN, null);
 
         BizException e = assertThrows(BizException.class, () -> review.approve(7L, null, ADMIN));
 
         assertEquals(1602, e.getCode());
         verify(schedule, never()).applyChanges(any(), any(), any());
+        verifyNoTransition();
+        assertEquals(SwapStatus.PENDING_ADMIN, row.getStatus());
+    }
+
+    /**
+     * 请假那一格（要写 L 的那格）在申请之后被删掉了：不能只把草稿改了就算批过，
+     * 成员那个月视图不会有任何变化，所以这一格也必须先确认还有已发布快照。
+     */
+    @Test
+    void approveLeaveWhenCellUnpublishedWritesNothing() {
+        SwapService review = reviewService();
+        SwapRequest row = stubFound(7L, SwapType.LEAVE, SwapStatus.PENDING_ADMIN, null);
+        // 默认所有格子都没有已发布快照（setUp 里打桩），等于科长批之前那格被收走了
+
+        BizException e = assertThrows(BizException.class, () -> review.approve(7L, "同意", ADMIN));
+
+        assertEquals(1602, e.getCode());
+        assertEquals("排班已变化，请驳回后重新申请", e.getMessage());
+        verify(schedule, never()).applyChanges(any(), any(), any());
+        verifyNoTransition();
+        assertEquals(SwapStatus.PENDING_ADMIN, row.getStatus());
+    }
+
+    /**
+     * 替班只检查本人那格不够：对方 {@code applyChanges} 时只更新已存在的已发布快照，
+     * 对方那格没了就会“申请 APPROVED、成员看不到有人接班”，所以缺对方那格同样 1602。
+     */
+    @Test
+    void approveCoverWhenPeerCellUnpublishedWritesNothing() {
+        SwapService review = reviewService();
+        SwapRequest row = stubFound(7L, SwapType.COVER, SwapStatus.PENDING_ADMIN, null);
+        when(query.publishedShift(1L, LEAVE_DAY)).thenReturn(Optional.of("N"));
+        // 李四 10-12 那格已被改成无班
+        when(query.publishedShift(2L, LEAVE_DAY)).thenReturn(Optional.empty());
+
+        BizException e = assertThrows(BizException.class, () -> review.approve(7L, null, ADMIN));
+
+        assertEquals(1602, e.getCode());
+        verify(schedule, never()).applyChanges(any(), any(), any());
+        verifyNoTransition();
+        assertEquals(SwapStatus.PENDING_ADMIN, row.getStatus());
+    }
+
+    /** 五个流程方法都必须带行锁读这一行，不许再用不带锁的 findById。 */
+    @Test
+    void everyTransitionReadsTheRowWithPessimisticLock() {
+        SwapService review = reviewService();
+        stubFound(1L, SwapType.SWAP, SwapStatus.PENDING_PEER, SWAP_DAY);
+        stubFound(2L, SwapType.SWAP, SwapStatus.PENDING_PEER, SWAP_DAY);
+        stubFound(3L, SwapType.SWAP, SwapStatus.PENDING_PEER, SWAP_DAY);
+        stubFound(4L, SwapType.LEAVE, SwapStatus.PENDING_ADMIN, null);
+        stubFound(5L, SwapType.LEAVE, SwapStatus.PENDING_ADMIN, null);
+        when(query.publishedShift(any(), any())).thenReturn(Optional.of("D"));
+
+        review.confirm(1L, LI);
+        review.rejectPeer(2L, LI);
+        review.cancel(3L, ZHANG);
+        review.approve(4L, null, ADMIN);
+        review.reject(5L, null, ADMIN);
+
+        for (long id = 1L; id <= 5L; id++) {
+            verify(em).find(SwapRequest.class, id, LockModeType.PESSIMISTIC_WRITE);
+        }
+        verify(repo, never()).findById(any());
+    }
+
+    // ---------- 并发竞争 ----------
+
+    /**
+     * 让两个操作真的同时跑到行锁上：两个线程都在取锁那一步等到对方到齐才继续，
+     * 于是各自读到同一份旧状态，再一起去抢同一次状态转换。
+     *
+     * @return 两个线程的结果：成功的那个是 {@link SwapVO}，被挡下的那个是 {@link BizException}
+     */
+    private List<Object> race(Callable<Object> first, Callable<Object> second) throws Exception {
+        lockBarrier = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            List<Future<Object>> futures = List.of(pool.submit(first), pool.submit(second));
+            List<Object> outcomes = new ArrayList<>();
+            for (Future<Object> future : futures) {
+                try {
+                    outcomes.add(future.get(30, TimeUnit.SECONDS));
+                } catch (ExecutionException e) {
+                    outcomes.add(e.getCause());
+                }
+            }
+            return outcomes;
+        } finally {
+            pool.shutdownNow();
+            lockBarrier = null;
+        }
+    }
+
+    /** 两个科长各点一次通过：只能有一个生效，另一个 1608，排班只回写一次。 */
+    @Test
+    void twoApprovalsOfTheSameRequestOnlyOneWins() throws Exception {
+        SwapService review = reviewService();
+        SwapRequest row = stubFound(7L, SwapType.LEAVE, SwapStatus.PENDING_ADMIN, null);
+        when(query.publishedShift(1L, LEAVE_DAY)).thenReturn(Optional.of("D"));
+
+        List<Object> outcomes = race(() -> review.approve(7L, "同意", ADMIN),
+                () -> review.approve(7L, "换个人替", ADMIN));
+
+        assertEquals(1, outcomes.stream().filter(o -> o instanceof SwapVO vo
+                && vo.status() == SwapStatus.APPROVED).count());
+        assertEquals(1, outcomes.stream().filter(o -> o instanceof BizException e && e.getCode() == 1608).count());
+        // 排班只被回写一次，日志也只留一条审批
+        verify(schedule, times(1)).applyChanges(any(), any(), any());
+        verify(opLog, times(1)).record(eq(OpAction.APPROVE_SWAP), any(), any());
+        assertEquals(SwapStatus.APPROVED, row.getStatus());
+    }
+
+    /** 科长点通过的同时申请人点撤销：两个都先看到了待审批，最后只能有一个作数。 */
+    @Test
+    void approvalAndCancellationDoNotBothTakeEffect() throws Exception {
+        SwapService review = reviewService();
+        SwapRequest row = stubFound(7L, SwapType.LEAVE, SwapStatus.PENDING_ADMIN, null);
+        when(query.publishedShift(1L, LEAVE_DAY)).thenReturn(Optional.of("D"));
+
+        List<Object> outcomes = race(() -> review.approve(7L, "同意", ADMIN), () -> review.cancel(7L, ZHANG));
+
+        assertEquals(1, outcomes.stream().filter(o -> o instanceof SwapVO).count());
+        assertEquals(1, outcomes.stream().filter(o -> o instanceof BizException e && e.getCode() == 1608).count());
+        if (row.getStatus() == SwapStatus.APPROVED) {
+            // 审批赢：排班刚好回写一次
+            verify(schedule, times(1)).applyChanges(any(), any(), any());
+        } else {
+            // 撤销赢：申请停在 CANCELLED，排班一格都不能动
+            assertEquals(SwapStatus.CANCELLED, row.getStatus());
+            verify(schedule, never()).applyChanges(any(), any(), any());
+        }
     }
 
     // ---------- 单据不存在 ----------
@@ -890,7 +1122,7 @@ class SwapServiceTest {
     @Test
     void missingRequestIs1600() {
         SwapService review = reviewService();
-        when(repo.findById(999L)).thenReturn(Optional.empty());
+        // 库里没有 999 这一行：em.find 默认返回 null
 
         assertEquals(1600, assertThrows(BizException.class, () -> review.confirm(999L, LI)).getCode());
         assertEquals(1600, assertThrows(BizException.class, () -> review.rejectPeer(999L, LI)).getCode());
@@ -900,7 +1132,7 @@ class SwapServiceTest {
         assertEquals("调班申请不存在", e.getMessage());
         assertEquals(1600, assertThrows(BizException.class, () -> review.reject(999L, null, ADMIN)).getCode());
 
-        verify(repo, never()).save(any());
+        verifyNoTransition();
         verifyNoInteractions(schedule);
     }
 }
