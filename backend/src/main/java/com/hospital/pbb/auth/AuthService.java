@@ -8,6 +8,9 @@ import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.user.AppUser;
 import com.hospital.pbb.user.AppUserRepository;
 import com.hospital.pbb.user.PasswordUtil;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.PersistenceContext;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -27,12 +30,17 @@ public class AuthService {
 
     public static final int LOCK_THRESHOLD = 5;
     public static final Duration LOCK_DURATION = Duration.ofMinutes(15);
+    /** app_user.username 和 operation_log.username 都是 VARCHAR(32) */
+    static final int USERNAME_MAX = 32;
 
     private final AppUserRepository repo;
     private final PasswordEncoder encoder;
     private final JwtService jwt;
     private final OpLogService opLog;
     private final Clock clock;
+
+    @PersistenceContext
+    private EntityManager entityManager;
 
     public AuthService(AppUserRepository repo, PasswordEncoder encoder, JwtService jwt,
                        OpLogService opLog, Clock clock) {
@@ -51,9 +59,13 @@ public class AuthService {
     public LoginResponse login(String username, String password) {
         AppUser user = repo.findByUsername(username).orElse(null);
         if (user == null) {
-            opLog.recordAs(null, username, OpAction.LOGIN_FAIL, username, "用户不存在");
+            String logName = clip(username);
+            opLog.recordAs(null, logName, OpAction.LOGIN_FAIL, logName, "用户不存在");
             throw new BizException(1001, "用户名或密码错误");
         }
+        // 行级排他锁：并发登录必须读到最新的 failed_attempts，否则会同时读到同一个次数、只加一次而绕过 5 次锁定。
+        // 锁持有到事务提交，同一账号的登录请求因此在数据库里串行处理。
+        entityManager.refresh(user, LockModeType.PESSIMISTIC_WRITE);
         if (!user.isEnabled()) {
             throw new BizException(1003, "账号已停用");
         }
@@ -117,5 +129,13 @@ public class AuthService {
     private static long remainingMinutes(OffsetDateTime now, OffsetDateTime lockedUntil) {
         long seconds = Duration.between(now, lockedUntil).getSeconds();
         return (seconds + 59) / 60;
+    }
+
+    /** 用户名由调用方传入，超长时不能直接写进 VARCHAR(32) 的日志字段 */
+    private static String clip(String username) {
+        if (username != null && username.length() > USERNAME_MAX) {
+            return username.substring(0, USERNAME_MAX);
+        }
+        return username;
     }
 }

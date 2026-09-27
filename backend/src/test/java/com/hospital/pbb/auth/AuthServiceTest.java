@@ -1,16 +1,25 @@
 package com.hospital.pbb.auth;
 
+import com.hospital.pbb.auth.dto.LoginRequest;
 import com.hospital.pbb.auth.dto.LoginResponse;
 import com.hospital.pbb.auth.dto.UserInfo;
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.user.AppUser;
 import com.hospital.pbb.user.AppUserRepository;
 import com.hospital.pbb.user.Role;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -18,6 +27,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -26,7 +36,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class AuthServiceTest {
@@ -40,6 +54,7 @@ class AuthServiceTest {
     private PasswordEncoder encoder;
     private JwtService jwt;
     private OpLogService opLog;
+    private EntityManager entityManager;
     private AuthService service;
     private AppUser user;
 
@@ -49,6 +64,7 @@ class AuthServiceTest {
         encoder = new BCryptPasswordEncoder();
         jwt = mock(JwtService.class);
         opLog = mock(OpLogService.class);
+        entityManager = mock(EntityManager.class);
         when(jwt.issue(any(AppUser.class))).thenReturn("token-abc");
         when(repo.save(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -64,6 +80,8 @@ class AuthServiceTest {
         when(repo.findById(1L)).thenReturn(Optional.of(user));
 
         service = new AuthService(repo, encoder, jwt, opLog, CLOCK);
+        // EntityManager 由 @PersistenceContext 字段注入，单元测试里手动塞一个 mock
+        ReflectionTestUtils.setField(service, "entityManager", entityManager);
     }
 
     private int bizCode(Runnable call) {
@@ -94,6 +112,50 @@ class AuthServiceTest {
     @Test
     void loginUnknownUserReturns1001() {
         assertEquals(1001, bizCode(() -> service.login("ghost", PASSWORD)));
+    }
+
+    /** 并发错误密码不能绕过锁定：读完后必须拿行级排他锁，再判断 enabled / lockedUntil / 密码 */
+    @Test
+    void loginLocksUserRowBeforeChecking() {
+        service.login("admin", PASSWORD);
+
+        verify(entityManager).refresh(user, LockModeType.PESSIMISTIC_WRITE);
+    }
+
+    @Test
+    void wrongPasswordStillLocksUserRow() {
+        assertEquals(1001, bizCode(() -> service.login("admin", "wrong123")));
+
+        verify(entityManager).refresh(user, LockModeType.PESSIMISTIC_WRITE);
+    }
+
+    /** 用户名长度不在数据库字段范围内时，不能把超长值直接写进操作日志（否则 VARCHAR(32) 报 500） */
+    @Test
+    void unknownUserWithTooLongUsernameLogsTruncatedName() {
+        String longName = "u".repeat(40);
+        when(repo.findByUsername(longName)).thenReturn(Optional.empty());
+
+        assertEquals(1001, bizCode(() -> service.login(longName, PASSWORD)));
+
+        ArgumentCaptor<String> logged = ArgumentCaptor.forClass(String.class);
+        verify(opLog).recordAs(isNull(), logged.capture(), eq(OpAction.LOGIN_FAIL), logged.capture(), eq("用户不存在"));
+        assertEquals(2, logged.getAllValues().size());
+        for (String value : logged.getAllValues()) {
+            assertEquals(AuthService.USERNAME_MAX, value.length());
+        }
+        verify(entityManager, never()).refresh(any(), any(LockModeType.class));
+    }
+
+    /** 校验层就要拦掉超长用户名，接口返回参数错误而不是数据库异常 */
+    @Test
+    void loginRequestRejectsUsernameLongerThan32() {
+        Validator validator = Validation.buildDefaultValidatorFactory().getValidator();
+
+        Set<ConstraintViolation<LoginRequest>> violations = validator.validate(new LoginRequest("u".repeat(33), PASSWORD));
+
+        assertEquals(1, violations.size());
+        assertEquals("username", violations.iterator().next().getPropertyPath().toString());
+        assertTrue(validator.validate(new LoginRequest("admin", PASSWORD)).isEmpty());
     }
 
     @Test
