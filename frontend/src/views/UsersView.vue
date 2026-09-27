@@ -61,7 +61,7 @@
   <el-dialog v-model="tempVisible" :title="tempTitle" width="440px" @closed="tempPassword = ''">
     <p class="temp-label">{{ tempUser }}</p>
     <p class="temp-value">{{ tempPassword }}</p>
-    <el-alert type="warning" :closable="false" show-icon title="该密码只显示一次，请立即复制并交给本人，首次登录后需修改。" />
+    <el-alert type="warning" :closable="false" show-icon :title="tempTip" />
     <template #footer>
       <el-button @click="copyTemp">复 制</el-button>
       <el-button type="primary" @click="tempVisible = false">我已记录</el-button>
@@ -70,7 +70,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as usersApi from '../api/users'
 
@@ -130,26 +130,44 @@ onMounted(load)
 const tempVisible = ref(false)
 const tempTitle = ref('临时密码')
 const tempUser = ref('')
+const tempRole = ref('')
 const tempPassword = ref('')
-const showTempPassword = (title, username, password) => {
+// SCREEN 账号后端不落 mustChangePassword（UserAdminService.java:67 / :92），
+// 只有会被真人登录的账号才提示首次登录必须改密
+const TIP_SCREEN = '该密码只显示一次，关闭后无法再次查看，请立即复制并妥善保存。'
+const TIP_STAFF = '该密码只显示一次，请立即复制并交给本人，首次登录后需修改。'
+const tempTip = computed(() => (tempRole.value === 'SCREEN' ? TIP_SCREEN : TIP_STAFF))
+const showTempPassword = (title, username, role, password) => {
   tempTitle.value = title
   tempUser.value = `账号：${username}`
+  tempRole.value = role
   tempPassword.value = password
   tempVisible.value = true
 }
 
+// 内网 http 下 clipboard 不可用，退回 execCommand；它返回 false 代表真没复制成功，不能当成成功
+const execCommandCopy = (text) => {
+  const input = document.createElement('textarea')
+  input.value = text
+  input.setAttribute('readonly', '')
+  input.style.position = 'fixed'
+  input.style.top = '-9999px'
+  document.body.appendChild(input)
+  input.select()
+  try {
+    return document.execCommand('copy')
+  } finally {
+    input.remove() // 抛异常也要清掉，不把明文密码留在页面上
+  }
+}
+
 const copyTemp = async () => {
+  if (!tempPassword.value) return
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(tempPassword.value)
-    } else {
-      // 内网 http 下 clipboard 不可用，退回 execCommand
-      const input = document.createElement('textarea')
-      input.value = tempPassword.value
-      document.body.appendChild(input)
-      input.select()
-      document.execCommand('copy')
-      document.body.removeChild(input)
+    } else if (!execCommandCopy(tempPassword.value)) {
+      throw new Error('execCommand copy returned false')
     }
     ElMessage.success('已复制到剪贴板')
   } catch {
@@ -180,7 +198,7 @@ const confirm = (message, title) =>
 const submitReset = async (row) => {
   if (!(await confirm(`确定重置「${row.displayName}」的密码？`, '重置密码'))) return
   const done = await run(() => usersApi.resetPassword(row.id))
-  if (done) showTempPassword('新密码已生成', row.username, done.data.tempPassword)
+  if (done) showTempPassword('新密码已生成', row.username, row.role, done.data.tempPassword)
 }
 
 const submitUnlock = async (row) => {
@@ -224,7 +242,7 @@ const submitCreate = async () => {
     const username = createForm.username.trim()
     createVisible.value = false
     ElMessage.success('账号已创建')
-    showTempPassword('初始密码', username, data.tempPassword)
+    showTempPassword('初始密码', username, 'SCREEN', data.tempPassword)
     await load()
   } catch {
     // 失败提示由 http 拦截器统一弹出，弹窗保留以便修改
