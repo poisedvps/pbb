@@ -3,13 +3,19 @@ package com.hospital.pbb.schedule;
 import com.hospital.pbb.holiday.HolidayRepository;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.DayVO;
+import com.hospital.pbb.schedule.dto.MineDayVO;
+import com.hospital.pbb.schedule.dto.MineVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.StaffRowVO;
+import com.hospital.pbb.shift.ShiftType;
+import com.hospital.pbb.shift.ShiftTypeRepository;
 import com.hospital.pbb.staff.Staff;
 import com.hospital.pbb.staff.StaffRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.util.ArrayList;
@@ -28,20 +34,27 @@ import java.util.Map;
 @Service
 public class ScheduleQueryService {
 
+    /** "下一个班次"往后找的天数上限，超出就不显示了（原型上只显示"下次班"一行） */
+    private static final int NEXT_LOOKAHEAD_DAYS = 60;
+
     private final ScheduleMonthRepository monthRepo;
     private final ScheduleEntryRepository entryRepo;
     private final SchedulePublishedEntryRepository publishedRepo;
     private final StaffRepository staffRepo;
     private final HolidayRepository holidayRepo;
+    private final ShiftTypeRepository shiftRepo;
+    private final Clock clock;
 
     public ScheduleQueryService(ScheduleMonthRepository monthRepo, ScheduleEntryRepository entryRepo,
                                 SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
-                                HolidayRepository holidayRepo) {
+                                HolidayRepository holidayRepo, ShiftTypeRepository shiftRepo, Clock clock) {
         this.monthRepo = monthRepo;
         this.entryRepo = entryRepo;
         this.publishedRepo = publishedRepo;
         this.staffRepo = staffRepo;
         this.holidayRepo = holidayRepo;
+        this.shiftRepo = shiftRepo;
+        this.clock = clock;
     }
 
     /**
@@ -95,6 +108,100 @@ public class ScheduleQueryService {
      */
     public RuleCalendar calendar(LocalDate start, LocalDate end) {
         return new RuleCalendar(holidayRepo.findOverlapping(start, end));
+    }
+
+    /**
+     * 本人某月的已发布排班（设计 §5 {@code /schedules/mine}）。
+     *
+     * <p>成员只看已发布快照，草稿与自己无关，所以这里只查 {@code schedule_published_entry}；
+     * 是否"已发布"以 {@code schedule_month.version} 为准，比快照表有没有行可靠——
+     * 整月本来就全是休息日时快照也可能一条都没有。</p>
+     *
+     * @param staffId   本人对应的人员 id，账号未关联人员（科长、大屏账号）时为 null，
+     *                  此时整月日历照常返回，只是每一格都没有班次
+     * @param yearMonth {@code YYYY-MM}，格式不对由 {@link ScheduleMonths#parse} 抛 code=1500
+     * @throws BizException code=1500，月份格式不合法
+     */
+    @Transactional(readOnly = true)
+    public MineVO mine(Long staffId, String yearMonth) {
+        YearMonth ym = ScheduleMonths.parse(yearMonth);
+        LocalDate start = ym.atDay(1);
+        LocalDate end = ym.atEndOfMonth();
+        RuleCalendar calendar = calendar(start, end);
+        Map<String, ShiftType> shifts = shiftByCode();
+        Map<LocalDate, String> codeByDate = publishedShiftCodes(staffId, start, end);
+
+        List<MineDayVO> days = new ArrayList<>(ym.lengthOfMonth());
+        // counts 按本月出现顺序统计，前端按这个顺序排各班次的图例
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        BigDecimal workHours = BigDecimal.ZERO;
+        for (LocalDate date = start; !date.isAfter(end); date = date.plusDays(1)) {
+            String shiftCode = codeByDate.get(date);
+            days.add(new MineDayVO(date, date.getDayOfWeek().getValue(),
+                    calendar.kindOf(date), calendar.holidayName(date), shiftCode));
+            if (shiftCode == null) {
+                continue;
+            }
+            counts.merge(shiftCode, 1, Integer::sum);
+            workHours = workHours.add(workHoursOf(shifts.get(shiftCode)));
+        }
+
+        ScheduleMonth month = monthRepo.findById(yearMonth).orElse(null);
+        return new MineVO(yearMonth, month != null && month.getVersion() > 0, days, counts, workHours,
+                nextShift(staffId, shifts));
+    }
+
+    /**
+     * 今天起 {@value #NEXT_LOOKAHEAD_DAYS} 天内第一个计工时的已发布班次。
+     *
+     * <p>休息、请假虽然也是排班，但不是"下次班"，所以按 {@code counts_as_work} 跳过；
+     * 查询已按日期升序，第一条满足条件的就是答案。</p>
+     */
+    private MineDayVO nextShift(Long staffId, Map<String, ShiftType> shifts) {
+        if (staffId == null) {
+            return null;
+        }
+        LocalDate today = LocalDate.now(clock);
+        LocalDate until = today.plusDays(NEXT_LOOKAHEAD_DAYS);
+        RuleCalendar calendar = calendar(today, until);
+        for (SchedulePublishedEntry entry : publishedRepo
+                .findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(staffId, today, until)) {
+            ShiftType shift = shifts.get(entry.getShiftCode());
+            if (shift == null || !shift.isCountsAsWork()) {
+                continue;
+            }
+            LocalDate date = entry.getWorkDate();
+            return new MineDayVO(date, date.getDayOfWeek().getValue(), calendar.kindOf(date),
+                    calendar.holidayName(date), entry.getShiftCode());
+        }
+        return null;
+    }
+
+    /** 本人 {@code [start, end]} 的已发布班次：workDate → shiftCode；未关联人员时空表。 */
+    private Map<LocalDate, String> publishedShiftCodes(Long staffId, LocalDate start, LocalDate end) {
+        Map<LocalDate, String> codes = new HashMap<>();
+        if (staffId == null) {
+            return codes;
+        }
+        for (SchedulePublishedEntry entry : publishedRepo
+                .findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(staffId, start, end)) {
+            codes.put(entry.getWorkDate(), entry.getShiftCode());
+        }
+        return codes;
+    }
+
+    /** 班次总共 6 条，一次取出建索引，免得逐格 findById。 */
+    private Map<String, ShiftType> shiftByCode() {
+        Map<String, ShiftType> shifts = new HashMap<>();
+        for (ShiftType shift : shiftRepo.findAllByOrderBySortOrderAsc()) {
+            shifts.put(shift.getCode(), shift);
+        }
+        return shifts;
+    }
+
+    /** 班次查不到（代号被改、数据残留）按 0 工时计，不能让整页统计报错。 */
+    private static BigDecimal workHoursOf(ShiftType shift) {
+        return shift == null || shift.getWorkHours() == null ? BigDecimal.ZERO : shift.getWorkHours();
     }
 
     /** 草稿：manual 原样带出，科长改过的格子重排规则时不再被覆盖。 */
