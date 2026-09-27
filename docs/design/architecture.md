@@ -48,7 +48,9 @@
 | stats | `stats` | `views/StatsView.vue` | 按人统计班次/工时，导出 |
 | oplog | `oplog` | `views/LogsView.vue` | 操作日志记录与查询 |
 
-模块边界：**只有 schedule 模块写 `schedule_entry` / `schedule_published_entry`**；swap 审批通过后调用 `ScheduleService` 的公开方法，不直接写表。
+模块边界：**只有 schedule 模块写 `schedule_month` / `schedule_entry` / `schedule_published_entry`**；swap 审批通过后调用 `ScheduleService.applyChanges`，不直接写表。跨模块**只读**可以直接用对方 Repository 的查询方法，**写**必须经过对方 Service。
+
+schedule 模块内部分为 `ScheduleQueryService`（只读：月视图、我的排班、规则日历）和 `ScheduleService`（写：生成、改格、发布、调班回写）；导出放在单独的 `ScheduleExportController`。
 
 ## 4. 数据表（Flyway `V1__init_schema.sql`）
 
@@ -101,14 +103,15 @@ for 每个 schedulable 且 active 的人员 s:
 | PUT | `/schedules/{yearMonth}/entries` | ADMIN | `{staffId, workDate, shiftCode|null}`；null=恢复规则默认 |
 | POST | `/schedules/{yearMonth}/generate` | ADMIN | 按规则生成 |
 | POST | `/schedules/{yearMonth}/publish` | ADMIN | |
-| GET | `/schedules/{yearMonth}/export` | 登录 | xlsx |
-| GET | `/schedules/mine?yearMonth=` | 登录 | 本人已发布排班 |
-| GET | `/screen?yearMonth=` | SCREEN / ADMIN | 整月已发布 + 今日概况 |
-| GET/POST | `/swaps` | 登录 | 列表 / 发起 |
+| GET | `/schedules/{yearMonth}/export` | 登录 | xlsx（ADMIN 导出草稿，其他导出已发布） |
+| GET | `/schedules/mine?yearMonth=` | 登录 | 本人已发布排班、各班次天数、工时、下一个班次 |
+| GET | `/screen?yearMonth=` | SCREEN / ADMIN | 整月已发布 + 今日概况；yearMonth 缺省为当月 |
+| GET/POST | `/swaps?scope=ALL\|MINE\|TODO` · `/swaps` | ADMIN / MEMBER | 列表 / 发起 |
 | POST | `/swaps/{id}/confirm` · `/reject-peer` | 对方成员 | |
+| POST | `/swaps/{id}/cancel` | 申请人 | 待确认、待审批时可撤销 |
 | POST | `/swaps/{id}/approve` · `/reject` | ADMIN | 通过后调用 schedule 模块回写并记日志 |
-| GET | `/stats?from=&to=` · `/stats/export` | 登录（MEMBER 仅本人） | |
-| GET | `/logs?page=&size=` | ADMIN | |
+| GET | `/stats?from=&to=` · `/stats/export` | ADMIN / MEMBER（MEMBER 仅本人） | 口径见 §5.4 |
+| GET | `/logs?page=&size=&username=&action=` | ADMIN | page 从 0 开始，倒序 |
 
 ### 5.1 错误码
 
@@ -123,6 +126,35 @@ for 每个 schedulable 且 active 的人员 s:
 | 1200–1202 | staff | 人员不存在 / 工号已存在 / 人员角色只能是科长或成员 |
 | 1300–1303 | shift | 班次不存在 / 白班和休息不能停用 / 上下班时间需同时填写 / 下班时间须晚于上班时间 |
 | 1400–1405 | holiday | 节假日不存在 / 结束早于开始 / 不能跨年 / 日期重叠 / 目标年已有数据 / 源年份无数据 |
+| 1500–1504 | schedule | 月份格式应为 YYYY-MM / 人员不存在或不参与排班 / 班次不存在或已停用 / 日期不在该月内 / 本月还没有排班 |
+| 1600–1609 | swap | 申请不存在 / 账号未关联人员 / 没有已发布的班次（含“排班已变化”） / 只能申请今天及以后 / 对方不能是自己 / 对方人员无效 / 缺少对方人员或日期 / 该日期已有进行中的申请 / 当前状态不允许此操作 / 无权操作该申请 |
+| 1700–1701 | stats | 开始日期晚于结束日期 / 统计范围超过 366 天 |
+
+### 5.2 排班数据结构
+
+- 月视图 `MonthScheduleVO { yearMonth, status, version, publishedAt, draft, days[], rows[] }`。`days[i] = { date, weekday(1-7), kind, holidayName }`，`rows[i] = { staffId, empNo, name, position, cells{ "YYYY-MM-DD": { shiftCode, manual, remark } } }`。
+- `kind` 为 `WORKDAY`、`WEEKEND`、`HOLIDAY`、`ADJUSTED_WORKDAY`（调休上班），由 `RuleCalendar` 统一计算。优先级：调休上班 > 放假 > 周末 > 工作日。
+- 行为 `active && schedulable` 的人员，按 `sort_order` 排序。
+- 写排班的操作都按月取 `pg_advisory_xact_lock(1500, 年*100+月)`，与 holiday 的 1400 号段区分。
+
+### 5.3 调班规则
+
+| 类型 | 需对方确认 | 审批通过后改动（A=申请人、B=对方，按审批时的已发布班次计算） |
+|---|---|---|
+| SWAP 换班 | 是 | 对 {A 日期, B 日期} 的每一天 d：A@d 与 B@d 互换 |
+| LEAVE 请假 | 否，直接待审批 | A@A日期 → L |
+| COVER 替班 | 是 | B@A日期 → A 原班次；A@A日期 → X |
+
+- 状态流转：`PENDING_PEER` →（对方同意）`PENDING_ADMIN` →（科长通过）`APPROVED`；对方拒绝或科长驳回 → `REJECTED`；申请人在两个待处理状态下可撤销 → `CANCELLED`。
+- 发起时校验：涉及的格子都必须有已发布班次，日期不早于今天，同一申请人同一天只能有一条进行中的申请。
+- 回写：同时改草稿（`is_manual=true`，remark=`调班 TB-xxxx`）和已发布快照；不改月份状态和版本号，所以无需重新发布，成员立即可见。
+
+### 5.4 统计口径
+
+- 数据源：`schedule_published_entry`，范围 `[from, to]`，最长 366 天。
+- 各班次天数：按班次代码计数。
+- 节假日/周末上班：班次 `counts_as_work=true`，且当天为 `WEEKEND` 或 `HOLIDAY` 的天数；调休上班日不算。
+- 总工时：各格对应班次当前的 `work_hours` 之和。
 
 ## 6. 安全规范
 
@@ -138,5 +170,5 @@ for 每个 schedulable 且 active 的人员 s:
 |---|---|
 | M0 | 项目骨架 + Docker 部署跑通（本次完成） |
 | M1 | 认证与账号、人员、班次、节假日（任务单见 `docs/design/tasks/M1.md`） |
-| M2 | 排班表（生成/编辑/发布）、我的排班、大屏 |
-| M3 | 调班申请、统计报表、导出、操作日志 |
+| M2 | 排班表（生成/编辑/发布）、我的排班、大屏（任务单见 `docs/design/tasks/M2.md`） |
+| M3 | 调班申请、统计报表、导出、操作日志、本机部署与冒烟验收（任务单见 `docs/design/tasks/M3.md`） |
