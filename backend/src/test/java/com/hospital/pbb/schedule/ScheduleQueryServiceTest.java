@@ -6,17 +6,25 @@ import com.hospital.pbb.holiday.HolidayRepository;
 import com.hospital.pbb.holiday.HolidayType;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.DayVO;
+import com.hospital.pbb.schedule.dto.MineDayVO;
+import com.hospital.pbb.schedule.dto.MineVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.StaffRowVO;
+import com.hospital.pbb.shift.ShiftType;
+import com.hospital.pbb.shift.ShiftTypeRepository;
 import com.hospital.pbb.staff.Staff;
 import com.hospital.pbb.staff.StaffRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -33,18 +41,26 @@ import static org.mockito.Mockito.when;
 /**
  * 月视图查询（任务单 M2-03 验收标准）：Mockito 打桩五个仓库，
  * 重点验"科长读草稿、其他人读已发布快照"这条分界，以及月份格式、节假日历的接入。
+ *
+ * <p>后半部分是"我的排班"（任务单 M2-06 验收标准），时钟固定为 2026-10-09。</p>
  */
 class ScheduleQueryServiceTest {
 
     private static final String YM = "2026-10";
     private static final LocalDate START = LocalDate.of(2026, 10, 1);
     private static final LocalDate END = LocalDate.of(2026, 10, 31);
+    private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
+    /** "我的排班"的"今天" */
+    private static final LocalDate TODAY = LocalDate.of(2026, 10, 9);
+    /** "下一个班次"的检索上限：今天 + 60 天 */
+    private static final LocalDate NEXT_UNTIL = TODAY.plusDays(60);
 
     private ScheduleMonthRepository monthRepo;
     private ScheduleEntryRepository entryRepo;
     private SchedulePublishedEntryRepository publishedRepo;
     private StaffRepository staffRepo;
     private HolidayRepository holidayRepo;
+    private ShiftTypeRepository shiftRepo;
     private ScheduleQueryService service;
 
     @BeforeEach
@@ -54,14 +70,22 @@ class ScheduleQueryServiceTest {
         publishedRepo = mock(SchedulePublishedEntryRepository.class);
         staffRepo = mock(StaffRepository.class);
         holidayRepo = mock(HolidayRepository.class);
-        service = new ScheduleQueryService(monthRepo, entryRepo, publishedRepo, staffRepo, holidayRepo);
+        shiftRepo = mock(ShiftTypeRepository.class);
+        Clock clock = Clock.fixed(TODAY.atStartOfDay(ZONE).toInstant(), ZONE);
+        service = new ScheduleQueryService(monthRepo, entryRepo, publishedRepo, staffRepo, holidayRepo,
+                shiftRepo, clock);
 
         // 默认：没有任何节假日、排班数据，schedule_month 里也还没有这一月
         when(holidayRepo.findOverlapping(any(), any())).thenReturn(List.of());
         when(entryRepo.findByWorkDateBetween(any(), any())).thenReturn(List.of());
         when(publishedRepo.findByWorkDateBetween(any(), any())).thenReturn(List.of());
+        when(publishedRepo.findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(any(), any(), any()))
+                .thenReturn(List.of());
         when(monthRepo.findById(any())).thenReturn(Optional.empty());
         when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc()).thenReturn(List.of(staff(1L, "A", true)));
+        when(shiftRepo.findAllByOrderBySortOrderAsc()).thenReturn(List.of(
+                shift("D", "8.0", true), shift("N", "14.5", true), shift("Z", "24.0", true),
+                shift("B", "0.0", false), shift("L", "0.0", false), shift("X", "0.0", false)));
     }
 
     private static Staff staff(Long id, String empNo, boolean schedulable) {
@@ -102,6 +126,25 @@ class ScheduleQueryServiceTest {
         entry.setShiftCode(shiftCode);
         entry.setRemark(remark);
         return entry;
+    }
+
+    /** 按 V1 预置的口径造班次：工时按 NUMERIC(4,1) 给 scale=1 */
+    private static ShiftType shift(String code, String workHours, boolean countsAsWork) {
+        ShiftType shift = new ShiftType();
+        shift.setCode(code);
+        shift.setName("班次" + code);
+        shift.setWorkHours(new BigDecimal(workHours));
+        shift.setCountsAsWork(countsAsWork);
+        shift.setEnabled(true);
+        return shift;
+    }
+
+    private static ScheduleMonth monthRow(int version) {
+        ScheduleMonth month = new ScheduleMonth();
+        month.setYearMonth(YM);
+        month.setStatus(version > 0 ? ScheduleStatus.PUBLISHED : ScheduleStatus.DRAFT);
+        month.setVersion(version);
+        return month;
     }
 
     /** 用例 1：整月 31 天，只列可排班的人员，没排班数据时 cells 为空、状态为未发布的 DRAFT */
@@ -230,5 +273,127 @@ class ScheduleQueryServiceTest {
         assertEquals("X", calendar.defaultShift(LocalDate.of(2026, 10, 11)));
         // 日历按整月范围查一次，不是逐日查
         verify(holidayRepo).findOverlapping(any(), any());
+    }
+
+    // ===== 以下是“我的排班”（任务单 M2-06）=====
+
+    /** 用例 1：本月已发布 N/D/X → counts 按出现顺序统计，工时 14.5+8.0+0.0=22.5，next 是今天第一个计工时的班 */
+    @Test
+    void mineCountsShiftsHoursAndNextShift() {
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(monthRow(3)));
+        when(publishedRepo.findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(1L, START, END))
+                .thenReturn(List.of(published(1L, "2026-10-08", "N", null),
+                        published(1L, "2026-10-09", "D", null),
+                        published(1L, "2026-10-10", "X", null)));
+        // 今天(10-09)往后的快照不含已过期的 10-08
+        when(publishedRepo.findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(1L, TODAY, NEXT_UNTIL))
+                .thenReturn(List.of(published(1L, "2026-10-09", "D", null),
+                        published(1L, "2026-10-10", "X", null)));
+
+        MineVO vo = service.mine(1L, YM);
+
+        assertEquals(YM, vo.yearMonth());
+        assertTrue(vo.published());
+        assertEquals(List.of("N", "D", "X"), List.copyOf(vo.counts().keySet()));
+        assertEquals(List.of(1, 1, 1), List.copyOf(vo.counts().values()));
+        assertEquals(0, vo.workHours().compareTo(new BigDecimal("22.5")));
+
+        assertEquals(31, vo.days().size());
+        assertNull(vo.days().get(0).shiftCode());                                     // 10-01 没排班
+        assertEquals("N", vo.days().get(7).shiftCode());                              // 10-08
+        assertEquals("D", vo.days().get(8).shiftCode());
+        assertEquals("X", vo.days().get(9).shiftCode());
+        assertEquals(5, vo.days().get(8).weekday());                                   // 10-09 是周五
+        assertEquals(DayKind.WORKDAY, vo.days().get(8).kind());
+        assertEquals(DayKind.WEEKEND, vo.days().get(9).kind());                        // 10-10 是周六
+
+        MineDayVO next = vo.next();
+        assertEquals(TODAY, next.date());
+        assertEquals("D", next.shiftCode());
+        assertEquals(DayKind.WORKDAY, next.kind());
+        assertNull(next.holidayName());
+    }
+
+    /** 用例 2：账号未关联人员 → 日历照出，但没有班次、没有统计、没有下次班，也不查快照 */
+    @Test
+    void mineWithoutStaffReturnsCalendarOnly() {
+        MineVO vo = service.mine(null, YM);
+
+        assertEquals(31, vo.days().size());
+        assertEquals(List.of(), vo.days().stream().map(MineDayVO::shiftCode).filter(Objects::nonNull).toList());
+        assertTrue(vo.counts().isEmpty());
+        assertEquals(0, vo.workHours().compareTo(BigDecimal.ZERO));
+        assertNull(vo.next());
+        assertFalse(vo.published());
+        verify(publishedRepo, never()).findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(any(), any(), any());
+    }
+
+    /** 用例 3：schedule_month 没有记录、或有记录但 version 还是 0，都算未发布 */
+    @Test
+    void mineReportsUnpublishedMonth() {
+        assertFalse(service.mine(1L, YM).published());
+
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(monthRow(0)));
+        assertFalse(service.mine(1L, YM).published());
+
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(monthRow(1)));
+        assertTrue(service.mine(1L, YM).published());
+    }
+
+    /** next 跳过不计工时的休息/请假，而且查的是 [今天, 今天+60] 这个范围自己的日历 */
+    @Test
+    void nextShiftSkipsOffDaysAndUsesItsOwnCalendarRange() {
+        when(publishedRepo.findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(1L, TODAY, NEXT_UNTIL))
+                .thenReturn(List.of(published(1L, "2026-10-10", "X", null),
+                        published(1L, "2026-10-11", "L", null),
+                        published(1L, "2026-11-05", "Z", null)));
+        when(holidayRepo.findOverlapping(TODAY, NEXT_UNTIL))
+                .thenReturn(List.of(holiday("立冬", "2026-11-05", "2026-11-05", HolidayType.HOLIDAY)));
+
+        MineVO vo = service.mine(1L, YM);
+
+        assertEquals(LocalDate.of(2026, 11, 5), vo.next().date());
+        assertEquals("Z", vo.next().shiftCode());
+        assertEquals(DayKind.HOLIDAY, vo.next().kind());
+        assertEquals("立冬", vo.next().holidayName());
+        verify(holidayRepo).findOverlapping(START, END);
+        verify(holidayRepo).findOverlapping(TODAY, NEXT_UNTIL);
+        // 本月没有任何班次
+        assertTrue(vo.counts().isEmpty());
+        assertEquals(0, vo.workHours().compareTo(BigDecimal.ZERO));
+    }
+
+    /** 60 天内没有计工时的班 → next 为 null */
+    @Test
+    void nextShiftIsNullWhenNothingCountsAsWork() {
+        when(publishedRepo.findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(1L, TODAY, NEXT_UNTIL))
+                .thenReturn(List.of(published(1L, "2026-10-10", "X", null),
+                        published(1L, "2026-12-08", "B", null)));
+
+        assertNull(service.mine(1L, YM).next());
+    }
+
+    /** 快照里的班次代号在 shift_type 查不到（数据残留）→ 计 0 工时，但天数照常统计 */
+    @Test
+    void unknownShiftCodeCountsZeroHours() {
+        when(publishedRepo.findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(1L, START, END))
+                .thenReturn(List.of(published(1L, "2026-10-12", "Q", null),
+                        published(1L, "2026-10-13", "D", null)));
+
+        MineVO vo = service.mine(1L, YM);
+
+        assertEquals(List.of("Q", "D"), List.copyOf(vo.counts().keySet()));
+        assertEquals(List.of(1, 1), List.copyOf(vo.counts().values()));
+        assertEquals(0, vo.workHours().compareTo(new BigDecimal("8.0")));
+    }
+
+    /** 月份格式不对 → 1500，不查任何数据 */
+    @Test
+    void mineWithInvalidYearMonthThrows1500() {
+        BizException e = assertThrows(BizException.class, () -> service.mine(1L, "2026/10"));
+
+        assertEquals(1500, e.getCode());
+        verify(publishedRepo, never()).findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(any(), any(), any());
+        verify(monthRepo, never()).findById(any());
     }
 }
