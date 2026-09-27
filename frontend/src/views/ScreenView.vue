@@ -92,6 +92,8 @@ const load = async () => {
   const d = new Date()
   try {
     data.value = await getScreen(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`)
+    // 刷新后人员可能减少、页数变少，不校正页码就会停在范围外的空页上，表格一直空白
+    if (page.value > totalPages.value) page.value = 1
   } catch {
     // 失败提示由 http 拦截器统一弹出（含 403「无权限」），这里只保留上一次画面，不让页面崩
   }
