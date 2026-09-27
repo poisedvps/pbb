@@ -8,6 +8,9 @@
       <el-button @click="prevMonth">‹</el-button>
       <b class="month">{{ monthText }}</b>
       <el-button @click="nextMonth">›</el-button>
+      <div class="sp"></div>
+      <!-- 没有关联人员的账号（比如没绑工号的科长）不是申请人，发起调班没有意义 -->
+      <el-button v-if="staffId" type="primary" @click="openSwap()">申请调班</el-button>
     </div>
 
     <div class="kpis">
@@ -35,7 +38,13 @@
 
       <div v-else-if="data" class="cal">
         <div v-for="w in WD" :key="w" class="h">{{ w }}</div>
-        <div v-for="(day, i) in cells" :key="i" class="d" :class="{ empty: !day, off: day && isOff(day) }">
+        <div
+          v-for="(day, i) in cells"
+          :key="i"
+          class="d"
+          :class="{ empty: !day, off: day && isOff(day), can: canSwap(day) }"
+          @click="onCellClick(day)"
+        >
           <template v-if="day">
             <div class="n">{{ dayNo(day.date) }}</div>
             <small v-if="day.holidayName" class="hol">{{ day.holidayName }}</small>
@@ -46,14 +55,20 @@
         </div>
       </div>
     </div>
+
+    <SwapDialog v-model="swapVisible" :default-date="swapDate" @created="onSwapCreated" />
   </el-card>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { getMine } from '../api/schedules'
 import { listShiftTypes } from '../api/shifts'
+import SwapDialog from '../components/SwapDialog.vue'
+import { useAuthStore } from '../stores/auth'
 
+const auth = useAuthStore()
 const pad = (n) => String(n).padStart(2, '0')
 const today = new Date()
 // ym 是唯一的月份状态，切月份只改它，再由 reload 拉数据
@@ -129,10 +144,32 @@ const cells = computed(() => {
 const dayNo = (date) => Number(date.slice(8, 10))
 const WD = ['一', '二', '三', '四', '五', '六', '日']
 const isOff = (day) => day.kind === 'WEEKEND' || day.kind === 'HOLIDAY'
+
+const staffId = computed(() => auth.user?.staffId || null)
+const swapVisible = ref(false)
+const swapDate = ref('')
+
+// YYYY-MM-DD 可以按字符串比大小；今天按点击那一刻算，跨零点也不把过期格子放开
+const dateStr = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+// 没班次的格子没有可调的班，过去的日期后端也不收，两类格子都不给点
+const canSwap = (day) => Boolean(staffId.value) && Boolean(day?.shiftCode) && day.date >= dateStr(new Date())
+
+// 先定日期再开弹窗：从按钮进来时 defaultDate 必须先清空，否则会用上一次点格子的日期预填
+const openSwap = (date = '') => {
+  swapDate.value = date
+  swapVisible.value = true
+}
+const onCellClick = (day) => {
+  if (canSwap(day)) openSwap(day.date)
+}
+
+// 调班要等对方确认、科长审批，这里只提示去哪儿看结果，不刷新我的排班
+const onSwapCreated = () => ElMessage.success('可在『调班申请』页查看进度')
 </script>
 
 <style scoped>
 .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.toolbar .sp { flex: 1; }
 .month { min-width: 90px; text-align: center; }
 
 .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
@@ -148,6 +185,8 @@ const isOff = (day) => day.kind === 'WEEKEND' || day.kind === 'HOLIDAY'
 /* 周末与放假整格压成灰底，一眼看出哪天不用上班 */
 .cal .d.off { background: #f8fafc; }
 .cal .d.empty { background: transparent; border: 0; }
+.cal .d.can { cursor: pointer; }
+.cal .d.can:hover { border-color: #1677c8; box-shadow: 0 0 0 1px #1677c8 inset; }
 .cal .d .n { font-size: 12px; color: #6b7280; }
 .cal .d .hol { display: block; color: #b91c1c; font-size: 11px; }
 .chip {
