@@ -28,6 +28,7 @@
 浏览器 ──:8090──> web(nginx) ──/api──> backend:8080 ──> db:5432（不对外暴露）
 ```
 
+- 服务器部署方案与端口见 `docs/design/deploy.md`（测试服务器对外端口 8097，本地开发仍为 8090）。
 - 所有密钥（数据库密码、JWT 密钥、初始管理员密码）只存在服务器上的 `.env`（git 忽略），仓库只有 `.env.example` 占位符。
 - 时区统一 `Asia/Shanghai`；日期字段用 `date`，时间戳用 `timestamptz`。
 
