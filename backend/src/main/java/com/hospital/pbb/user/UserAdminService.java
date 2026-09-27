@@ -6,12 +6,14 @@ import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.user.dto.CreateUserRequest;
 import com.hospital.pbb.user.dto.TempPasswordVO;
 import com.hospital.pbb.user.dto.UserVO;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.sql.SQLException;
 import java.util.List;
 
 /**
@@ -21,6 +23,11 @@ import java.util.List;
  */
 @Service
 public class UserAdminService {
+
+    /** V1__init_schema.sql 里 app_user.username 的 UNIQUE 约束名 */
+    static final String USERNAME_UNIQUE_CONSTRAINT = "app_user_username_key";
+    /** PostgreSQL 的 unique_violation */
+    private static final String UNIQUE_VIOLATION_SQL_STATE = "23505";
 
     private final AppUserRepository repo;
     private final PasswordEncoder encoder;
@@ -60,7 +67,16 @@ public class UserAdminService {
         user.setMustChangePassword(false);
         user.setCreatedAt(now);
         user.setUpdatedAt(now);
-        repo.save(user);
+        try {
+            // 强制写入：预检查到提交之间存在竞态，两个请求可能同时通过 existsByUsername，
+            // 必须由数据库唯一约束兜底，不能把约束冲突直接抛成 500。
+            repo.saveAndFlush(user);
+        } catch (DataIntegrityViolationException e) {
+            if (!isUsernameConflict(e)) {
+                throw e; // 其他完整性冲突原样抛出，事务照常回滚
+            }
+            throw new BizException(1201, "用户名已存在");
+        }
 
         opLog.record(OpAction.CREATE_USER, req.username(), "role=SCREEN");
         return new TempPasswordVO(tempPassword);
@@ -116,6 +132,33 @@ public class UserAdminService {
 
     private AppUser loadUser(Long id) {
         return repo.findById(id).orElseThrow(() -> new BizException(1100, "账号不存在"));
+    }
+
+    /**
+     * 只认用户名唯一约束冲突：约束名命中，或 SQLState 为 23505 且异常链里出现 username。
+     * 其余完整性冲突（非空、外键、别的表的唯一约束）一律返回 false 由调用方原样抛出。
+     */
+    private static boolean isUsernameConflict(DataIntegrityViolationException e) {
+        boolean duplicateKey = false;
+        for (Throwable t = e; t != null && t != t.getCause(); t = t.getCause()) {
+            if (t instanceof SQLException sql && UNIQUE_VIOLATION_SQL_STATE.equals(sql.getSQLState())) {
+                duplicateKey = true;
+            }
+            String msg = t.getMessage();
+            if (msg != null && msg.contains(USERNAME_UNIQUE_CONSTRAINT)) {
+                return true;
+            }
+        }
+        if (!duplicateKey) {
+            return false;
+        }
+        for (Throwable t = e; t != null && t != t.getCause(); t = t.getCause()) {
+            String msg = t.getMessage();
+            if (msg != null && msg.contains("username")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static UserVO toVO(AppUser u, OffsetDateTime now) {

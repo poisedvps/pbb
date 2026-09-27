@@ -9,9 +9,11 @@ import com.hospital.pbb.user.dto.UserVO;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -24,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -51,6 +54,7 @@ class UserAdminServiceTest {
         encoder = new BCryptPasswordEncoder();
         opLog = mock(OpLogService.class);
         when(repo.save(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(repo.saveAndFlush(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
         service = new UserAdminService(repo, encoder, opLog, CLOCK);
     }
 
@@ -149,7 +153,7 @@ class UserAdminServiceTest {
         assertTrue(PasswordUtil.isStrong(vo.tempPassword()));
 
         ArgumentCaptor<AppUser> saved = ArgumentCaptor.forClass(AppUser.class);
-        verify(repo).save(saved.capture());
+        verify(repo).saveAndFlush(saved.capture());
         AppUser u = saved.getValue();
         assertEquals("screen1", u.getUsername());
         assertEquals("值班大屏", u.getDisplayName());
@@ -171,6 +175,53 @@ class UserAdminServiceTest {
         ArgumentCaptor<String> detail = ArgumentCaptor.forClass(String.class);
         verify(opLog).record(eq(OpAction.CREATE_USER), eq("screen1"), detail.capture());
         assertFalse(detail.getAllValues().contains(vo.tempPassword()));
+    }
+
+    /**
+     * 两个管理员同时新增同名账号：预检查都通过，后一个在唯一约束上失败。
+     * 必须转成 1201（不是 500），且不记新增账号日志。异常链按 Hibernate + PostgreSQL 的真实形状模拟。
+     */
+    @Test
+    void createScreenUserMapsUsernameUniqueViolationTo1201() {
+        SQLException root = new SQLException(
+                "ERROR: duplicate key value violates unique constraint \"app_user_username_key\"", "23505");
+        org.hibernate.exception.ConstraintViolationException hibernate =
+                new org.hibernate.exception.ConstraintViolationException(
+                        "Batch entry violated unique constraint app_user_username_key", root, "app_user_username_key");
+        when(repo.saveAndFlush(any(AppUser.class)))
+                .thenThrow(new DataIntegrityViolationException(
+                        "could not execute statement [duplicate key value]", hibernate));
+
+        assertEquals(1201, bizCode(() ->
+                service.createScreenUser(new CreateUserRequest("screen1", "值班大屏", Role.SCREEN))));
+
+        verify(opLog, never()).record(any(), any(), any());
+    }
+
+    /** SQLState 已是 23505 且异常链里提到 username 时（约束名未带的驱动）同样归 1201 */
+    @Test
+    void createScreenUserMapsStateOnlyUsernameDuplicateTo1201() {
+        SQLException root = new SQLException("duplicate key value violates unique constraint on column username", "23505");
+        when(repo.saveAndFlush(any(AppUser.class)))
+                .thenThrow(new DataIntegrityViolationException("could not execute statement", root));
+
+        assertEquals(1201, bizCode(() ->
+                service.createScreenUser(new CreateUserRequest("screen1", "值班大屏", Role.SCREEN))));
+    }
+
+    /** 其他完整性冲突（这里是非空约束）不能误当成重名，必须原样抛出以保证回滚和 500 定位 */
+    @Test
+    void createScreenUserRethrowsOtherIntegrityViolation() {
+        SQLException root = new SQLException("ERROR: null value in column \"display_name\" violates not-null constraint", "23502");
+        DataIntegrityViolationException other =
+                new DataIntegrityViolationException("could not execute statement", root);
+        when(repo.saveAndFlush(any(AppUser.class))).thenThrow(other);
+
+        DataIntegrityViolationException thrown = assertThrows(DataIntegrityViolationException.class, () ->
+                service.createScreenUser(new CreateUserRequest("screen1", "值班大屏", Role.SCREEN)));
+
+        assertSame(other, thrown);
+        verify(opLog, never()).record(any(), any(), any());
     }
 
     @Test
