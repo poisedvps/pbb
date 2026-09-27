@@ -10,7 +10,10 @@ if [ -n "$PORT_ARG" ]; then
   case "$PORT_ARG" in
     ''|*[!0-9]*) echo "端口无效：$PORT_ARG"; exit 1 ;;
   esac
-  if [ "$PORT_ARG" -lt 1 ] || [ "$PORT_ARG" -gt 65535 ]; then
+  # 先按字符串长度排除超长数字（避免整数比较溢出），再按 10 进制安全比较范围
+  if [ "${#PORT_ARG}" -gt 5 ] \
+     || [ "$((10#$PORT_ARG))" -lt 1 ] \
+     || [ "$((10#$PORT_ARG))" -gt 65535 ]; then
     echo "端口无效：$PORT_ARG"; exit 1
   fi
 fi
