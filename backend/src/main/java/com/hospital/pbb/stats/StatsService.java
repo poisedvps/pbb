@@ -87,6 +87,52 @@ public class StatsService {
         return new StatsVO(from, to, rows);
     }
 
+    /**
+     * 导出表头（任务单 M3-08）：工号、姓名、各班次名称（顺序同班次 sort_order）、节假日/周末上班、总工时。
+     *
+     * <p>列顺序以 {@code shift_type} 为准，不是以某一行的 counts 为准：表头要永远和统计页的列
+     * 一一对应，不能因为某个人一个班没排就少一列。</p>
+     */
+    @Transactional(readOnly = true)
+    public List<String> exportHeaders() {
+        List<ShiftType> shifts = shiftRepo.findAllByOrderBySortOrderAsc();
+        List<String> headers = new ArrayList<>(shifts.size() + 4);
+        headers.add("工号");
+        headers.add("姓名");
+        for (ShiftType shift : shifts) {
+            headers.add(shift.getName());
+        }
+        headers.add("节假日/周末上班");
+        headers.add("总工时");
+        return headers;
+    }
+
+    /**
+     * 把 {@link #stats} 的结果摊平成导出用的行，列顺序与 {@link #exportHeaders()} 完全一致；
+     * 各班次天数、节假日/周末上班是 {@code Integer}，总工时是 {@code BigDecimal}，
+     * 交给 {@link com.hospital.pbb.common.ExcelWriter} 后都是能求和的数值格。
+     *
+     * <p>counts 里查不到对应班次的残留代号（{@code shift_type} 已删）在这里被丢掉——
+     * 没有表头的列真写出来反而会和表头错位。</p>
+     */
+    @Transactional(readOnly = true)
+    public List<List<Object>> exportRows(StatsVO vo) {
+        List<String> codes = shiftCodes();
+        List<List<Object>> rows = new ArrayList<>(vo.rows().size());
+        for (StatsRowVO row : vo.rows()) {
+            List<Object> cells = new ArrayList<>(codes.size() + 4);
+            cells.add(row.empNo());
+            cells.add(row.name());
+            for (String code : codes) {
+                cells.add(row.counts().get(code));
+            }
+            cells.add(row.offDayWork());
+            cells.add(row.totalHours());
+            rows.add(cells);
+        }
+        return rows;
+    }
+
     /** 成员只能看自己那一行；账号没关联人员（科长之外的账号）时一行都没有。 */
     private static boolean visibleTo(Staff staff, AuthUser me) {
         if (me.role() == Role.ADMIN) {
@@ -136,5 +182,14 @@ public class StatsService {
             shifts.put(shift.getCode(), shift);
         }
         return shifts;
+    }
+
+    /** 班次代号，按 sort_order 升序；导出的班次列顺序、以及取哪几列 counts 都听它。 */
+    private List<String> shiftCodes() {
+        List<String> codes = new ArrayList<>();
+        for (ShiftType shift : shiftRepo.findAllByOrderBySortOrderAsc()) {
+            codes.add(shift.getCode());
+        }
+        return codes;
     }
 }
