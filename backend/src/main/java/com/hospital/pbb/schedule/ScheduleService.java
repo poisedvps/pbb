@@ -1,0 +1,215 @@
+package com.hospital.pbb.schedule;
+
+import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.oplog.OpAction;
+import com.hospital.pbb.oplog.OpLogService;
+import com.hospital.pbb.schedule.dto.CellVO;
+import com.hospital.pbb.schedule.dto.GenerateResultVO;
+import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
+import com.hospital.pbb.shift.ShiftType;
+import com.hospital.pbb.shift.ShiftTypeRepository;
+import com.hospital.pbb.staff.Staff;
+import com.hospital.pbb.staff.StaffRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Clock;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.YearMonth;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 排班写入：按规则生成整月、改单个单元格（设计 §5.1、任务单 M2-04）。
+ *
+ * <p>写口径只有两条：生成是"整月按规则铺一遍"，改格子是"整月按规则铺过之后的人工修正"。
+ * 手工改过的格子打 {@code is_manual}，重新生成时原样保留，科长不至于被一键生成冲掉已排好的班。</p>
+ *
+ * <p>两个写方法都先取当月 advisory lock 再读写：生成和改格子作用在同一批 {@code (staff_id, work_date)}
+ * 行上，不锁月的话两个科长会互相覆盖，操作日志也会记下一条库里并不存在的变更。
+ * 锁是事务级的，随事务提交或回滚释放，所以整个方法必须待在同一个事务里。</p>
+ *
+ * <p>任何写入都把月份状态打回 {@link ScheduleStatus#DRAFT}：已发布的快照是另一张表，
+ * 草稿改了不等于成员看到的变了，必须重新发布（M2-05）才会生效。</p>
+ */
+@Service
+public class ScheduleService {
+
+    private static final DateTimeFormatter MONTH_DAY = DateTimeFormatter.ofPattern("MM-dd");
+
+    private final ScheduleMonthRepository monthRepo;
+    private final ScheduleEntryRepository entryRepo;
+    private final SchedulePublishedEntryRepository publishedRepo;
+    private final StaffRepository staffRepo;
+    private final ShiftTypeRepository shiftRepo;
+    private final ScheduleQueryService query;
+    private final OpLogService opLog;
+    private final Clock clock;
+
+    public ScheduleService(ScheduleMonthRepository monthRepo, ScheduleEntryRepository entryRepo,
+                           SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
+                           ShiftTypeRepository shiftRepo, ScheduleQueryService query,
+                           OpLogService opLog, Clock clock) {
+        this.monthRepo = monthRepo;
+        this.entryRepo = entryRepo;
+        // 快照表由 M2-05 的发布写入，这里注入是为了锁与读写口径一致，本单不碰快照
+        this.publishedRepo = publishedRepo;
+        this.staffRepo = staffRepo;
+        this.shiftRepo = shiftRepo;
+        this.query = query;
+        this.opLog = opLog;
+        this.clock = clock;
+    }
+
+    /**
+     * 按规则生成整月默认班次。
+     *
+     * <p>已手工改过的格子跳过不覆盖，其余格子一律重写成规则默认值；
+     * 已经不存在于可排班名单里的人员的历史草稿不在本次范围内，保持不变。</p>
+     *
+     * @param yearMonth  {@code YYYY-MM}，格式不对由 {@link ScheduleMonths#parse} 抛 code=1500
+     * @param operatorId 操作人（科长）id，写入格子的 {@code updated_by}
+     * @return 写入格数与跳过的手工格数
+     */
+    @Transactional
+    public GenerateResultVO generate(String yearMonth, Long operatorId) {
+        YearMonth ym = ScheduleMonths.parse(yearMonth);
+        monthRepo.lockMonth(ScheduleMonths.lockKey(ym));
+
+        LocalDate start = ym.atDay(1);
+        LocalDate end = ym.atEndOfMonth();
+        RuleCalendar calendar = query.calendar(start, end);
+        Map<String, ScheduleEntry> existing = existingEntries(start, end);
+        OffsetDateTime now = OffsetDateTime.now(clock);
+
+        int generated = 0;
+        int skippedManual = 0;
+        for (Staff staff : schedulableStaff()) {
+            for (LocalDate date = start; !date.isAfter(end); date = date.plusDays(1)) {
+                ScheduleEntry entry = existing.get(key(staff.getId(), date));
+                if (entry != null && entry.isManual()) {
+                    skippedManual++;
+                    continue;
+                }
+                if (entry == null) {
+                    entry = newEntry(staff.getId(), date);
+                }
+                entry.setShiftCode(calendar.defaultShift(date));
+                entry.setManual(false);
+                entry.setUpdatedBy(operatorId);
+                entry.setUpdatedAt(now);
+                entryRepo.save(entry);
+                generated++;
+            }
+        }
+
+        markDraft(yearMonth);
+        opLog.record(OpAction.GENERATE_SCHEDULE, yearMonth,
+                "生成" + generated + "格，跳过手工" + skippedManual + "格");
+        return new GenerateResultVO(generated, skippedManual);
+    }
+
+    /**
+     * 改一个单元格。
+     *
+     * @param yearMonth  {@code YYYY-MM}，接口路径上的月份；{@code req.workDate()} 必须落在这个月内
+     * @param req        人员、日期、班次代号（null 表示恢复规则默认）、备注
+     * @param operatorId 操作人（科长）id
+     * @return 改动后的格子
+     * @throws BizException code=1500 月份格式不合法；1501 人员不存在或不参与排班；
+     *                      1502 班次不存在或已停用；1503 日期不在该月内
+     */
+    @Transactional
+    public CellVO updateEntry(String yearMonth, UpdateEntryRequest req, Long operatorId) {
+        YearMonth ym = ScheduleMonths.parse(yearMonth);
+        monthRepo.lockMonth(ScheduleMonths.lockKey(ym));
+
+        LocalDate workDate = req.workDate();
+        if (workDate.isBefore(ym.atDay(1)) || workDate.isAfter(ym.atEndOfMonth())) {
+            throw new BizException(1503, "日期不在该月内");
+        }
+        Staff staff = staffRepo.findById(req.staffId())
+                .filter(s -> s.isActive() && s.isSchedulable())
+                .orElseThrow(() -> new BizException(1501, "人员不存在或不参与排班"));
+
+        RuleCalendar calendar = query.calendar(ym.atDay(1), ym.atEndOfMonth());
+        String shiftCode;
+        boolean manual;
+        if (req.shiftCode() == null) {
+            // 恢复默认不算手工修改：重算规则值，并且摘掉 manual 标记，下次生成可以正常覆盖
+            shiftCode = calendar.defaultShift(workDate);
+            manual = false;
+        } else {
+            ShiftType shift = shiftRepo.findById(req.shiftCode())
+                    .filter(ShiftType::isEnabled)
+                    .orElseThrow(() -> new BizException(1502, "班次不存在或已停用"));
+            shiftCode = shift.getCode();
+            manual = true;
+        }
+
+        ScheduleEntry entry = entryRepo.findByStaffIdAndWorkDate(staff.getId(), workDate)
+                .orElseGet(() -> newEntry(staff.getId(), workDate));
+        String oldCode = entry.getShiftCode();
+        String remark = (req.remark() == null || req.remark().isEmpty()) ? null : req.remark();
+        entry.setShiftCode(shiftCode);
+        entry.setManual(manual);
+        entry.setRemark(remark);
+        entry.setUpdatedBy(operatorId);
+        entry.setUpdatedAt(OffsetDateTime.now(clock));
+        entryRepo.save(entry);
+
+        markDraft(yearMonth);
+        // 旧 code 为空 = 这个格子以前没排过班，日志里留成"空 → 新 code"，便于区分"新增"和"改班"
+        opLog.record(OpAction.UPDATE_SCHEDULE, staff.getName() + " " + workDate.format(MONTH_DAY),
+                (oldCode == null ? "" : oldCode) + " → " + shiftCode);
+        return new CellVO(shiftCode, manual, remark);
+    }
+
+    /**
+     * 把当月状态打回草稿。
+     *
+     * <p>从没碰过的月份在 {@code schedule_month} 里没有记录，先按初始值补一条再置状态，
+     * version 和 publishedAt 都不动——那是发布（M2-05）维护的字段。</p>
+     */
+    private void markDraft(String yearMonth) {
+        ScheduleMonth month = monthRepo.findById(yearMonth).orElseGet(() -> {
+            ScheduleMonth created = new ScheduleMonth();
+            created.setYearMonth(yearMonth);
+            created.setStatus(ScheduleStatus.DRAFT);
+            created.setVersion(0);
+            return created;
+        });
+        month.setStatus(ScheduleStatus.DRAFT);
+        monthRepo.save(month);
+    }
+
+    /** 生成只铺"启用中且参与排班"的人员，顺序沿用月视图的人员排序 */
+    private List<Staff> schedulableStaff() {
+        return staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc().stream()
+                .filter(Staff::isSchedulable)
+                .toList();
+    }
+
+    /** 整月已有草稿一次读出来建索引，避免逐人逐日各查一次库 */
+    private Map<String, ScheduleEntry> existingEntries(LocalDate start, LocalDate end) {
+        Map<String, ScheduleEntry> map = new HashMap<>();
+        for (ScheduleEntry entry : entryRepo.findByWorkDateBetween(start, end)) {
+            map.put(key(entry.getStaffId(), entry.getWorkDate()), entry);
+        }
+        return map;
+    }
+
+    private static ScheduleEntry newEntry(Long staffId, LocalDate workDate) {
+        ScheduleEntry entry = new ScheduleEntry();
+        entry.setStaffId(staffId);
+        entry.setWorkDate(workDate);
+        return entry;
+    }
+
+    private static String key(Long staffId, LocalDate workDate) {
+        return staffId + "|" + workDate;
+    }
+}
