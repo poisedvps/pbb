@@ -16,10 +16,22 @@
       <!-- 区间以返回体为准：换范围的请求还在路上时，屏幕上仍是上一份数据，导出的也必须是那一份 -->
       <span v-if="data" class="note">{{ data.from }} 至 {{ data.to }}</span>
       <div class="sp"></div>
-      <el-button :disabled="!data" @click="exportExcel">导出 Excel</el-button>
+      <el-button :disabled="!canExport" @click="exportExcel">导出 Excel</el-button>
     </div>
 
+    <!-- 班次取不到就没有班次列，缺列的报表既不能看也不能导，宁可空着让科长重试 -->
+    <el-alert v-if="!shiftsReady" class="alert" type="error" show-icon :closable="false">
+      <template #title>班次列表加载失败，统计报表的班次列无法显示</template>
+      <template #default>
+        <div class="alert-body">
+          <span>各班次那一组列取自班次设置，取不到时不给一份缺列的报表，也不允许导出。</span>
+          <el-button size="small" :loading="shiftsLoading" @click="loadShifts">重新加载</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-table
+      v-else
       v-loading="loading"
       :data="rows"
       border
@@ -43,6 +55,7 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import { getStats } from '../api/stats'
 import { listShiftTypes } from '../api/shifts'
 import { download } from '../api/download'
@@ -61,6 +74,9 @@ const year = ref(now.getFullYear())
 // 这样改年份时选中的那个月不会跟着跳到 1 月。默认当前月。
 const rangeKey = ref(`M${pad(now.getMonth() + 1)}`)
 const shifts = ref([])
+// 班次是表头的一半，取不到时这份报表就是残缺的：shiftsReady 决定表格出不出现，canExport 决定能不能导
+const shiftsLoading = ref(false)
+const shiftsReady = ref(false)
 const data = ref(null)
 const loading = ref(false)
 
@@ -99,7 +115,7 @@ const range = computed(() => {
 const reload = async () => {
   const target = range.value
   const seq = ++reqSeq
-  if (!target) {
+  if (!target || !shiftsReady.value) {
     data.value = null
     return
   }
@@ -115,14 +131,26 @@ const reload = async () => {
   }
 }
 
-onMounted(async () => {
-  reload()
+// 班次列和统计行是两份独立数据，只有两份都拿到才给看：班次失败就整张表让路，
+// 免得科长拿一份少了几列的报表当结论，甚至导出带走
+const loadShifts = async () => {
+  if (shiftsLoading.value) return
+  shiftsLoading.value = true
   try {
     shifts.value = await listShiftTypes()
+    shiftsReady.value = true
+    await reload()
   } catch {
-    // 班次取不到只是少了各班次那几列，姓名 / 节假日 / 工时照常显示
+    shifts.value = []
+    shiftsReady.value = false
+    data.value = null
+    ElMessage.error('班次列表加载失败，统计报表暂不可用')
+  } finally {
+    shiftsLoading.value = false
   }
-})
+}
+
+onMounted(loadShifts)
 
 watch([year, rangeKey], reload)
 
@@ -144,10 +172,13 @@ const summary = ({ columns }) => {
   return cells
 }
 
-// 导出的就是屏幕上这份表：区间取返回体的 from / to，不是下拉框里正在切换的那个
+// 导出的就是屏幕上这份表：区间取返回体的 from / to，不是下拉框里正在切换的那个；
+// 班次列没到位时屏幕上根本没有完整报表，导出来的也不是它，所以按钮一并禁掉
+const canExport = computed(() => shiftsReady.value && !!data.value)
+
 const exportExcel = () => {
   const view = data.value
-  if (!view) return
+  if (!canExport.value || !view) return
   download('/stats/export', { from: view.from, to: view.to }, '统计-' + view.from + '至' + view.to + '.xlsx')
 }
 </script>
@@ -159,4 +190,5 @@ const exportExcel = () => {
 .toolbar .sp { flex: 1; }
 .year { width: 96px; }
 .range { width: 180px; }
+.alert .alert-body { display: flex; align-items: center; gap: 10px; font-size: 13px; }
 </style>
