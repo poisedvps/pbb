@@ -38,8 +38,13 @@ cp scripts/deploy.env.example scripts/deploy.env   # 填写服务器信息
 scripts/deploy.sh                                  # 输入服务器 sudo 密码
 ```
 
+`scripts/deploy.env` 中两个可选项：
+
+- `PBB_HTTP_PORT`：服务器对外 HTTP 端口，每次部署写入服务器 `.env`；不填则保持服务器 `.env` 原值。
+- `SUDO_NOPASS`：`1` 表示服务器已为 `remote-deploy.sh` 配置免密 sudo，部署时不再询问密码；`0`（默认）表示询问密码。
+
 首次部署会在服务器生成 `.env`（随机数据库密码、JWT 密钥、初始管理员密码），只保存在服务器上。
-访问：`http://<服务器地址>:8090`，健康检查：`/api/health`。
+访问：`http://<服务器地址>:<PBB_HTTP_PORT>`，健康检查：`/api/health`。
 
 常用运维（在服务器部署目录下）：
 
