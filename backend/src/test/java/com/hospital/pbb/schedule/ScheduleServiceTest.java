@@ -5,6 +5,7 @@ import com.hospital.pbb.holiday.Holiday;
 import com.hospital.pbb.holiday.HolidayType;
 import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
+import com.hospital.pbb.schedule.dto.CellChange;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
 import com.hospital.pbb.schedule.dto.PublishResultVO;
@@ -57,6 +58,9 @@ class ScheduleServiceTest {
     private static final LocalDate END = LocalDate.of(2026, 10, 31);
     private static final LocalDate D5 = LocalDate.of(2026, 10, 5);
     private static final LocalDate D10 = LocalDate.of(2026, 10, 10);
+    /** 调班回写写进 remark 和日志 target 的那句话（任务单 M3-01） */
+    private static final String SWAP_TARGET = "调班 TB-0001";
+    private static final int NOV_LOCK_KEY = 202611;
     private static final Long OPERATOR = 7L;
     /** 固定的"当前时间"：2026-09-30 08:00 +08:00 */
     private static final OffsetDateTime NOW =
@@ -132,6 +136,15 @@ class ScheduleServiceTest {
         month.setStatus(status);
         month.setVersion(version);
         return month;
+    }
+
+    private static SchedulePublishedEntry snapshot(Long staffId, LocalDate date, String shiftCode, int version) {
+        SchedulePublishedEntry entry = new SchedulePublishedEntry();
+        entry.setStaffId(staffId);
+        entry.setWorkDate(date);
+        entry.setShiftCode(shiftCode);
+        entry.setVersion(version);
+        return entry;
     }
 
     private static Holiday holiday(String name, String start, String end, HolidayType type) {
@@ -546,5 +559,101 @@ class ScheduleServiceTest {
         assertEquals(1500, e.getCode());
         verify(monthRepo, never()).lockMonth(LOCK_KEY);
         verify(publishedRepo, never()).deleteByWorkDateRange(any(), any());
+    }
+
+    // ---------- applyChanges（任务单 M3-01：调班回写）----------
+
+    /** 用例：A 10-08→X、B 10-08→N，两人草稿和已发布都有 → 草稿两格 manual=true 带备注，已发布两格代码跟着改 */
+    @Test
+    void applyChangesWritesBothDraftAndPublishedSnapshot() {
+        LocalDate d8 = LocalDate.of(2026, 10, 8);
+        when(entryRepo.findByStaffIdAndWorkDate(1L, d8)).thenReturn(Optional.of(draft(1L, d8, "D", false)));
+        when(entryRepo.findByStaffIdAndWorkDate(2L, d8)).thenReturn(Optional.of(draft(2L, d8, "N", false)));
+        when(publishedRepo.findByStaffIdAndWorkDate(1L, d8)).thenReturn(Optional.of(snapshot(1L, d8, "D", 3)));
+        when(publishedRepo.findByStaffIdAndWorkDate(2L, d8)).thenReturn(Optional.of(snapshot(2L, d8, "N", 3)));
+
+        service.applyChanges(List.of(new CellChange(1L, d8, "X"), new CellChange(2L, d8, "N")),
+                SWAP_TARGET, OPERATOR);
+
+        Map<String, ScheduleEntry> saved = savedEntries();
+        assertEquals(2, saved.size());
+        ScheduleEntry a = saved.get("1|" + d8);
+        assertEquals("X", a.getShiftCode());
+        assertTrue(a.isManual());
+        assertEquals(SWAP_TARGET, a.getRemark());
+        assertEquals(OPERATOR, a.getUpdatedBy());
+        assertEquals(NOW, a.getUpdatedAt());
+        ScheduleEntry b = saved.get("2|" + d8);
+        assertEquals("N", b.getShiftCode());
+        assertTrue(b.isManual());
+        assertEquals(SWAP_TARGET, b.getRemark());
+
+        ArgumentCaptor<SchedulePublishedEntry> captor = ArgumentCaptor.forClass(SchedulePublishedEntry.class);
+        verify(publishedRepo, times(2)).save(captor.capture());
+        List<SchedulePublishedEntry> snapshots = captor.getAllValues();
+        assertEquals("X", snapshots.get(0).getShiftCode());
+        assertEquals(SWAP_TARGET, snapshots.get(0).getRemark());
+        // 回写不是发布：快照仍属原来那一版，version 不能被改
+        assertEquals(3, snapshots.get(0).getVersion());
+        assertEquals("N", snapshots.get(1).getShiftCode());
+
+        verify(monthRepo, times(1)).lockMonth(LOCK_KEY);
+        verify(opLog).record(OpAction.APPLY_SWAP_TO_SCHEDULE, SWAP_TARGET, "共2格");
+    }
+
+    /** 用例：这个格子没有已发布记录 → 只写草稿，不报错也不补插快照 */
+    @Test
+    void applyChangesWritesDraftOnlyWhenSnapshotMissing() {
+        when(publishedRepo.findByStaffIdAndWorkDate(1L, D5)).thenReturn(Optional.empty());
+
+        service.applyChanges(List.of(new CellChange(1L, D5, "N")), SWAP_TARGET, OPERATOR);
+
+        ScheduleEntry saved = savedEntries().get("1|" + D5);
+        assertEquals("N", saved.getShiftCode());
+        assertTrue(saved.isManual());
+        assertEquals(SWAP_TARGET, saved.getRemark());
+        assertEquals(OPERATOR, saved.getUpdatedBy());
+        verify(publishedRepo, never()).save(any());
+        verify(publishedRepo, never()).saveAll(any());
+        verify(opLog).record(OpAction.APPLY_SWAP_TO_SCHEDULE, SWAP_TARGET, "共1格");
+    }
+
+    /** 库里没这个草稿格子时新建一条，staffId/workDate 从 change 上带 */
+    @Test
+    void applyChangesCreatesMissingDraftCell() {
+        service.applyChanges(List.of(new CellChange(2L, D10, "Z")), SWAP_TARGET, OPERATOR);
+
+        ScheduleEntry saved = savedEntries().get("2|" + D10);
+        assertEquals(2L, saved.getStaffId());
+        assertEquals(D10, saved.getWorkDate());
+        assertEquals("Z", saved.getShiftCode());
+    }
+
+    /** 用例：不调 markDraft——月份状态和 version 一律不动，连 schedule_month 都不去读、不补记录 */
+    @Test
+    void applyChangesLeavesMonthStatusAndVersionUntouched() {
+        service.applyChanges(List.of(new CellChange(1L, D5, "N")), SWAP_TARGET, OPERATOR);
+
+        verify(monthRepo, never()).save(any(ScheduleMonth.class));
+        verify(monthRepo, never()).findById(anyString());
+    }
+
+    /** 用例：跨 10、11 月 → 先 lockMonth(202610) 再 lockMonth(202611)，同月去重只锁一次，锁在写库之前 */
+    @Test
+    void applyChangesLocksMonthsAscendingAndDeduplicated() {
+        LocalDate d8 = LocalDate.of(2026, 10, 8);
+        LocalDate d20 = LocalDate.of(2026, 10, 20);
+        LocalDate nov5 = LocalDate.of(2026, 11, 5);
+
+        // 11 月那条先传，锁仍要先 10 月后 11 月；10 月两格只锁一次
+        service.applyChanges(List.of(new CellChange(1L, nov5, "D"), new CellChange(1L, d8, "X"),
+                new CellChange(1L, d20, "N")), SWAP_TARGET, OPERATOR);
+
+        InOrder order = inOrder(monthRepo, entryRepo);
+        order.verify(monthRepo).lockMonth(LOCK_KEY);
+        order.verify(monthRepo).lockMonth(NOV_LOCK_KEY);
+        order.verify(entryRepo, times(3)).save(any(ScheduleEntry.class));
+        verify(monthRepo, times(1)).lockMonth(LOCK_KEY);
+        verify(monthRepo, times(1)).lockMonth(NOV_LOCK_KEY);
     }
 }

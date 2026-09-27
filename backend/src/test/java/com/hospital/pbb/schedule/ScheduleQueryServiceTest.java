@@ -396,4 +396,29 @@ class ScheduleQueryServiceTest {
         verify(publishedRepo, never()).findByStaffIdAndWorkDateBetweenOrderByWorkDateAsc(any(), any(), any());
         verify(monthRepo, never()).findById(any());
     }
+
+    // ===== 以下是“某人某天的已发布班次”（任务单 M3-01）=====
+
+    /** 用例：快照里有这条记录 → Optional.of("D")，只按 (staffId, workDate) 查一次快照 */
+    @Test
+    void publishedShiftReturnsCodeWhenSnapshotExists() {
+        LocalDate day = LocalDate.of(2026, 10, 8);
+        when(publishedRepo.findByStaffIdAndWorkDate(1L, day))
+                .thenReturn(Optional.of(published(1L, "2026-10-08", "D", "顶班")));
+
+        assertEquals(Optional.of("D"), service.publishedShift(1L, day));
+
+        verify(publishedRepo).findByStaffIdAndWorkDate(1L, day);
+        // 调班校验的是成员已经看到的那个班，草稿表一律不查
+        verify(entryRepo, never()).findByStaffIdAndWorkDate(any(), any());
+    }
+
+    /** 用例：那天没排到班、或者整月还没发布 → Optional.empty() */
+    @Test
+    void publishedShiftIsEmptyWhenNoRecord() {
+        LocalDate day = LocalDate.of(2026, 10, 8);
+        when(publishedRepo.findByStaffIdAndWorkDate(1L, day)).thenReturn(Optional.empty());
+
+        assertEquals(Optional.empty(), service.publishedShift(1L, day));
+    }
 }
