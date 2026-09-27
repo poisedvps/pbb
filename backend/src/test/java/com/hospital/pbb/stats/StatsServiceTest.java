@@ -280,4 +280,52 @@ class StatsServiceTest {
         assertEquals(1, vo.rows().get(0).counts().get("N"));
         assertEquals(1, vo.rows().get(0).offDayWork());
     }
+
+    /** M3-08 验收：6 个班次 → 表头 2+6+2=10 列，最后两列固定为节假日/周末上班、总工时 */
+    @Test
+    void exportHeadersAreStaffColumnsPlusShiftNamesPlusTwoTotals() {
+        List<String> headers = service.exportHeaders();
+
+        assertEquals(10, headers.size());
+        // 班次列名用 name（不是代号），顺序同班次 sort_order
+        assertEquals(List.of("工号", "姓名", "班次D", "班次N", "班次Z", "班次B", "班次L", "班次X",
+                "节假日/周末上班", "总工时"), headers);
+    }
+
+    /** M3-08 验收：每行 10 个值且顺序同表头；残留代号不占列；没排班的人也有一行全 0 */
+    @Test
+    void exportRowsMatchHeadersAndEveryRowHasTenCells() {
+        calendarWith();
+        when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc())
+                .thenReturn(List.of(staff(1L, "A001", "张三"), staff(2L, "B002", "李四")));
+        when(publishedRepo.findByWorkDateBetween(FROM, TO)).thenReturn(List.of(
+                published(1L, "2026-10-05", "D"),
+                published(1L, "2026-10-10", "N"),    // 2026-10-10 是周六
+                published(1L, "2026-10-11", "Q")));  // shift_type 里查不到的残留代号
+
+        List<List<Object>> rows = service.exportRows(service.stats(FROM, TO, ADMIN));
+
+        assertEquals(2, rows.size());
+        for (List<Object> row : rows) {
+            assertEquals(10, row.size());
+        }
+
+        List<Object> zhang = rows.get(0);
+        // Q 没有对应的班次列，不写进导出（写出来会和表头错位）
+        assertEquals(List.of("A001", "张三", 1, 1, 0, 0, 0, 0, 1), zhang.subList(0, 9));
+        assertEquals(Integer.class, zhang.get(2).getClass());
+        assertEquals(Integer.class, zhang.get(8).getClass());
+        assertEquals(0, ((BigDecimal) zhang.get(9)).compareTo(new BigDecimal("22.5")));
+
+        List<Object> li = rows.get(1);
+        assertEquals(List.of("B002", "李四", 0, 0, 0, 0, 0, 0, 0, new BigDecimal("0")), li);
+    }
+
+    /** 一行数据都没有（成员没关联人员）→ 导出只有表头，行列表为空 */
+    @Test
+    void exportRowsIsEmptyWhenStatsHasNoRows() {
+        StatsVO vo = service.stats(FROM, TO, new AuthUser(3L, "screen", Role.MEMBER, null));
+
+        assertEquals(List.of(), service.exportRows(vo));
+    }
 }
