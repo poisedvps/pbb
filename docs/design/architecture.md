@@ -87,9 +87,10 @@ for 每个 schedulable 且 active 的人员 s:
 | POST | `/auth/logout` | 登录 | |
 | GET | `/auth/me` | 登录 | 当前用户、角色、`mustChangePassword` |
 | POST | `/auth/change-password` | 登录 | `{oldPassword,newPassword}`，≥8 位含字母和数字 |
-| GET/POST/PUT | `/staff`、`/staff/{id}` | ADMIN | 人员列表/新增/修改；新增时自动建 MEMBER 账号 |
-| PUT | `/staff/order` | ADMIN | `[id...]` 保存排序 |
+| GET/POST/PUT | `/staff`、`/staff/{id}` | ADMIN | 人员列表/新增/修改；新增时自动建账号（用户名 = 工号，角色 ADMIN 或 MEMBER） |
+| PUT | `/staff/order` | ADMIN | `[id...]` 保存排序（界面用“上移/下移”按钮，不做拖拽） |
 | GET | `/users` | ADMIN | 账号列表 |
+| POST | `/users` | ADMIN | 新增**大屏账号**（仅 SCREEN 角色；ADMIN/MEMBER 账号随人员创建） |
 | POST | `/users/{id}/reset-password` · `/unlock` · `/disable` · `/enable` | ADMIN | |
 | GET/PUT | `/shift-types`、`/shift-types/{code}` | 登录 / ADMIN | |
 | GET | `/holidays?year=` | 登录 | |
@@ -108,6 +109,20 @@ for 每个 schedulable 且 active 的人员 s:
 | GET | `/stats?from=&to=` · `/stats/export` | 登录（MEMBER 仅本人） | |
 | GET | `/logs?page=&size=` | ADMIN | |
 
+### 5.1 错误码
+
+业务错误统一 HTTP 200 + `{code, message}`；鉴权错误用 HTTP 401/403。
+
+| 范围 | 模块 | 已定义 |
+|---|---|---|
+| 400 / 401 / 403 / 404 / 500 | 通用 | 参数错误 / 未登录或登录已过期 / 无权限 / 接口不存在 / 系统错误 |
+| 4031 | 通用 | 请先修改初始密码（HTTP 403） |
+| 1001–1006 | auth | 用户名或密码错误 / 账号已锁定 / 账号已停用 / 原密码错误 / 新密码强度不足 / 新旧密码相同 |
+| 1100–1102 | user | 账号不存在 / 不能停用自己 / 只能新增大屏账号 |
+| 1200–1202 | staff | 人员不存在 / 工号已存在 / 人员角色只能是科长或成员 |
+| 1300–1303 | shift | 班次不存在 / 白班和休息不能停用 / 上下班时间需同时填写 / 下班时间须晚于上班时间 |
+| 1400–1405 | holiday | 节假日不存在 / 结束早于开始 / 不能跨年 / 日期重叠 / 目标年已有数据 / 源年份无数据 |
+
 ## 6. 安全规范
 
 - 密码 BCrypt 存储；初始管理员 `admin` 首次启动时由 `.env` 的 `PBB_ADMIN_INIT_PASSWORD` 创建，`must_change_password=true`。
@@ -121,6 +136,6 @@ for 每个 schedulable 且 active 的人员 s:
 | 里程碑 | 内容 |
 |---|---|
 | M0 | 项目骨架 + Docker 部署跑通（本次完成） |
-| M1 | 认证与账号、人员、班次、节假日 |
+| M1 | 认证与账号、人员、班次、节假日（任务单见 `docs/design/tasks/M1.md`） |
 | M2 | 排班表（生成/编辑/发布）、我的排班、大屏 |
 | M3 | 调班申请、统计报表、导出、操作日志 |
