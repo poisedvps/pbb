@@ -410,4 +410,22 @@ describe('M4-14 暂存', () => {
     await click(btnByText('暂存（0）'))
     expect(saveDraft).not.toHaveBeenCalled()
   })
+
+  it('兜底：屏幕月份与格子日期对不上时整批作废，不发暂存', async () => {
+    const { wrapper } = await mountView2()
+    // yearMonth 是 10 月、days 还是 9 月那 6 天：前三道闸全放行，只剩 workDate 归属检查能拦住
+    getSchedule.mockReset().mockResolvedValue({
+      ...monthOf('2026-09', daysOf('2026-09', 6)),
+      yearMonth: '2026-10'
+    })
+    await click(btnByText('›'))
+    await flushPromises()
+    await click(cellTds(wrapper)[0])
+    await click(btnByText('确定'))
+    expect(pendingTds(wrapper)).toHaveLength(1)
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft).not.toHaveBeenCalled()
+    expect(ElMessage.warning).toHaveBeenCalledWith('待暂存的修改不属于当前月份，已作废，请重新修改')
+    expect(pendingTds(wrapper)).toHaveLength(0)
+  })
 })
