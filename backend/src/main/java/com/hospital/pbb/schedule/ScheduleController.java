@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -45,11 +46,17 @@ public class ScheduleController {
         return ApiResponse.ok(queryService.getMonth(yearMonth, draft));
     }
 
-    /** 按规则生成整月默认班次，科长手工改过的格子保留原样 */
+    /**
+     * 按周期模板生成整月默认班次，科长手工改过的格子保留原样。
+     *
+     * <p>{@code templateId} 不传则用默认模板，一个默认模板也没有时按内置规则（周六日 X、工作日 D）。</p>
+     */
     @PostMapping("/{yearMonth}/generate")
     @PreAuthorize("hasRole('ADMIN')")
-    public ApiResponse<GenerateResultVO> generate(@PathVariable String yearMonth, @AuthenticationPrincipal AuthUser me) {
-        return ApiResponse.ok(scheduleService.generate(yearMonth, me.id()));
+    public ApiResponse<GenerateResultVO> generate(@PathVariable String yearMonth,
+                                                 @RequestParam(required = false) Long templateId,
+                                                 @AuthenticationPrincipal AuthUser me) {
+        return ApiResponse.ok(scheduleService.generate(yearMonth, templateId, me.id()));
     }
 
     /** 改一个单元格，请求体里的 {@code shiftCode} 传 null 表示恢复规则默认 */

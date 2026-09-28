@@ -92,6 +92,63 @@ class RuleCalendarTest {
         assertEquals("国庆调休", calendar.holidayName(saturday));
     }
 
+    // ---------- 按周期模板取默认班次（任务单 M4-05）----------
+
+    /** 周一..周日：N X D D D X X */
+    private static final List<String> TEMPLATE_DAYS = List.of("N", "X", "D", "D", "D", "X", "X");
+
+    @Test
+    void templateDecidesPlainDays() {
+        RuleCalendar calendar = empty();
+
+        // 10-05 周一（普通日）→ 模板周一 N
+        assertEquals("N", calendar.defaultShift(LocalDate.of(2026, 10, 5), TEMPLATE_DAYS));
+        // 10-07 周三 → 模板周三 D
+        assertEquals("D", calendar.defaultShift(LocalDate.of(2026, 10, 7), TEMPLATE_DAYS));
+        // 10-10 普通周六 → 模板周六 X
+        assertEquals("X", calendar.defaultShift(LocalDate.of(2026, 10, 10), TEMPLATE_DAYS));
+        // 换成双休排 N 的模板，同一个周六就排 N
+        assertEquals("N", calendar.defaultShift(LocalDate.of(2026, 10, 10),
+                List.of("D", "D", "D", "D", "D", "N", "N")));
+    }
+
+    @Test
+    void adjustedWorkdayStillIsDRegardlessOfTemplate() {
+        RuleCalendar calendar = new RuleCalendar(
+                List.of(record("国庆调休", "2026-10-10", "2026-10-10", HolidayType.WORKDAY)));
+        LocalDate saturday = LocalDate.of(2026, 10, 10);
+
+        // 模板周六是 X，但 10-10 登记成了调休上班日 → 还是 D
+        assertEquals(DayKind.ADJUSTED_WORKDAY, calendar.kindOf(saturday));
+        assertEquals("D", calendar.defaultShift(saturday, TEMPLATE_DAYS));
+        // 同一个日子在没有登记的年份照模板走
+        assertEquals("X", empty().defaultShift(saturday, TEMPLATE_DAYS));
+    }
+
+    @Test
+    void holidayStillIsXRegardlessOfTemplate() {
+        RuleCalendar calendar = new RuleCalendar(
+                List.of(record("国庆节", "2026-10-06", "2026-10-06", HolidayType.HOLIDAY)));
+        List<String> allWork = List.of("D", "D", "D", "D", "D", "D", "D");
+
+        // 10-06 周二登记为放假日：模板全是 D，也还是 X
+        assertEquals(DayKind.HOLIDAY, calendar.kindOf(LocalDate.of(2026, 10, 6)));
+        assertEquals("X", calendar.defaultShift(LocalDate.of(2026, 10, 6), allWork));
+        // 区间外照模板：10-05 周一 → D
+        assertEquals("D", calendar.defaultShift(LocalDate.of(2026, 10, 5), allWork));
+    }
+
+    @Test
+    void nullTemplateDaysEqualsBuiltinDefaultShift() {
+        RuleCalendar calendar = empty();
+        LocalDate saturday = LocalDate.of(2026, 10, 10);
+
+        // 普通周六、days=null → 内置规则 X
+        assertEquals("X", calendar.defaultShift(saturday, null));
+        assertEquals(calendar.defaultShift(saturday), calendar.defaultShift(saturday, null));
+        assertEquals("D", calendar.defaultShift(LocalDate.of(2026, 10, 5), null));
+    }
+
     @Test
     void parseValidMonth() {
         assertEquals(YearMonth.of(2026, 10), ScheduleMonths.parse("2026-10"));

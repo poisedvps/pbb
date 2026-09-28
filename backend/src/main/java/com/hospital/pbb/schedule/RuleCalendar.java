@@ -89,4 +89,26 @@ public class RuleCalendar {
         DayKind kind = kindOf(date);
         return kind == DayKind.WEEKEND || kind == DayKind.HOLIDAY;
     }
+
+    /**
+     * 按周期模板取默认班次：调休上班日 → D；放假日 → X；其余日子 → days.get(星期几 - 1)。
+     *
+     * <p>节假日永远压过模板——模板只管"这一星期几上什么班"，国庆该休息还是休息，
+     * 调休该上班还是上班（设计 §8.5）。</p>
+     *
+     * @param days 7 个班次代号（下标 0=周一），为 null 时等同 {@link #defaultShift(LocalDate)}
+     */
+    public String defaultShift(LocalDate date, List<String> days) {
+        if (days == null) {
+            return defaultShift(date);
+        }
+        DayKind kind = kindOf(date);
+        if (kind == DayKind.ADJUSTED_WORKDAY) {
+            return "D";
+        }
+        if (kind == DayKind.HOLIDAY) {
+            return "X";
+        }
+        return days.get(date.getDayOfWeek().getValue() - 1);
+    }
 }
