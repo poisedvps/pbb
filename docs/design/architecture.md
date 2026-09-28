@@ -207,6 +207,7 @@ for 每个 schedulable 且 active 的人员 s:
 模块边界补充：
 - 只有 schedule 写 `duty_phone_week`、`duty_phone_published` 和 `schedule_month.cycle_template_id`；只有 cycle 写 `cycle_template`；只有 shift 写 `app_setting`。
 - schedule 只读 `cycle_template`（按规则生成、恢复规则默认）与 `app_setting`（月视图带出底色）；stats 只读 `duty_phone_published`。
+- cycle 的写操作（新增、修改、删除模板）进入事务后第一步取表级锁 `pg_advisory_xact_lock(1800, 0)`，锁内再查重、读当前默认、切换默认，保证并发切换默认不撞部分唯一索引 `uq_cycle_template_default`；号段 1800 与 holiday 的 1400、schedule 的 1500 区分。schedule 只读模板，不取此锁。
 
 ### 8.3 数据表（Flyway `V2__cycle_template_duty_phone.sql`）
 
