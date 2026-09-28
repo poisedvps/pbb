@@ -7,8 +7,11 @@ import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.dto.CellChange;
 import com.hospital.pbb.schedule.dto.CellVO;
+import com.hospital.pbb.schedule.dto.DutyPhoneChange;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
 import com.hospital.pbb.schedule.dto.PublishResultVO;
+import com.hospital.pbb.schedule.dto.SaveDraftRequest;
+import com.hospital.pbb.schedule.dto.SaveDraftResultVO;
 import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
@@ -18,6 +21,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.YearMonth;
@@ -25,6 +29,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 
 /**
  * 排班写入：按规则生成整月、改单个单元格（设计 §5.1、任务单 M2-04）。
@@ -32,7 +37,7 @@ import java.util.Map;
  * <p>写口径只有两条：生成是"整月按规则铺一遍"，改格子是"整月按规则铺过之后的人工修正"。
  * 手工改过的格子打 {@code is_manual}，重新生成时原样保留，科长不至于被一键生成冲掉已排好的班。</p>
  *
- * <p>两个写方法都先取当月 advisory lock 再读写：生成和改格子作用在同一批 {@code (staff_id, work_date)}
+ * <p>写方法都先取当月 advisory lock 再读写：生成和改格子作用在同一批 {@code (staff_id, work_date)}
  * 行上，不锁月的话两个科长会互相覆盖，操作日志也会记下一条库里并不存在的变更。
  * 锁是事务级的，随事务提交或回滚释放，所以整个方法必须待在同一个事务里。</p>
  *
@@ -54,8 +59,9 @@ public class ScheduleService {
     private final Clock clock;
     /** 按周期模板生成用（M4-05） */
     private final CycleTemplateRepository templateRepo;
-    /** 下面两个仓库从 M4-09/M4-13（值班电话暂存与发布）起使用，本单只注入不使用 */
+    /** 值班电话草稿：暂存（M4-09）写它 */
     private final DutyPhoneWeekRepository dutyRepo;
+    /** 值班电话已发布快照：发布（M4-13）把草稿复制过去，暂存不碰 */
     private final DutyPhonePublishedRepository dutyPublishedRepo;
 
     public ScheduleService(ScheduleMonthRepository monthRepo, ScheduleEntryRepository entryRepo,
@@ -192,11 +198,24 @@ public class ScheduleService {
         if (workDate.isBefore(ym.atDay(1)) || workDate.isAfter(ym.atEndOfMonth())) {
             throw new BizException(1503, "日期不在该月内");
         }
-        Staff staff = staffRepo.findById(req.staffId())
-                .filter(s -> s.isActive() && s.isSchedulable())
-                .orElseThrow(() -> new BizException(1501, "人员不存在或不参与排班"));
 
-        RuleCalendar calendar = query.calendar(ym.atDay(1), ym.atEndOfMonth());
+        CellVO cell = writeEntry(yearMonth, req, operatorId, query.calendar(ym.atDay(1), ym.atEndOfMonth()));
+        markDraft(yearMonth);
+        return cell;
+    }
+
+    /**
+     * 写一格草稿并留痕，单格保存与暂存共用（取锁、校验之后）。
+     *
+     * <p>{@code shiftCode=null} 是“恢复规则默认”：按该月记录的模板重算默认值，并且摘掉 manual 标记，
+     * 下次按规则生成时这一格会被正常覆盖；传了班次就是科长的手工修正，打 {@code is_manual}。</p>
+     *
+     * @param calendar 该月的规则日历，由调用方取一次复用，不必逐格查节假日
+     */
+    private CellVO writeEntry(String yearMonth, UpdateEntryRequest req, Long operatorId, RuleCalendar calendar) {
+        Staff staff = validStaff(req.staffId());
+        LocalDate workDate = req.workDate();
+
         String shiftCode;
         boolean manual;
         if (req.shiftCode() == null) {
@@ -204,10 +223,7 @@ public class ScheduleService {
             shiftCode = calendar.defaultShift(workDate, templateDaysOf(yearMonth));
             manual = false;
         } else {
-            ShiftType shift = shiftRepo.findById(req.shiftCode())
-                    .filter(ShiftType::isEnabled)
-                    .orElseThrow(() -> new BizException(1502, "班次不存在或已停用"));
-            shiftCode = shift.getCode();
+            shiftCode = validShift(req.shiftCode()).getCode();
             manual = true;
         }
 
@@ -222,11 +238,147 @@ public class ScheduleService {
         entry.setUpdatedAt(OffsetDateTime.now(clock));
         entryRepo.save(entry);
 
-        markDraft(yearMonth);
         // 旧 code 为空 = 这个格子以前没排过班，日志里留成"空 → 新 code"，便于区分"新增"和"改班"
         opLog.record(OpAction.UPDATE_SCHEDULE, staff.getName() + " " + workDate.format(MONTH_DAY),
                 (oldCode == null ? "" : oldCode) + " → " + shiftCode);
         return new CellVO(shiftCode, manual, remark);
+    }
+
+    /**
+     * 暂存：把页面上改过的全部格子与值班电话一次性写回草稿（设计 §8.5“暂存”）。
+     *
+     * <p>先校验全部再写：科长一次提交几十格，如果写到第 12 格才发现班次已停用，前 11 格已经落库，
+     * 页面上的“已改”和库里的“已存”就对不上了。所以校验阶段任何一条不合法都直接抛错，一格都不写。</p>
+     *
+     * <p>值班电话按周存，跨月那一周同时属于上个月和本月，所以锁与打回草稿都要覆盖
+     * “本月 + 每个周跨到的月份”，去重升序逐个取（与 {@link #applyChanges} 同一口径，逆序取锁会死锁）。
+     * 只处理本月的话，上个月的状态还停在已发布，可它边界那一周的值班电话已经被改掉了。</p>
+     *
+     * @param yearMonth  {@code YYYY-MM}，格子日期必须落在这个月内；值班电话的周只要与该月有交集即可
+     * @param req        整批格子与值班电话，{@code dutyPhones.staffId=null} 表示清除该周
+     * @param operatorId 操作人（科长）id，写入格子与值班电话的 {@code updated_by}
+     * @return 本次写入的格数与周数
+     * @throws BizException code=1500 月份格式不合法；1501 人员不存在或不参与排班；
+     *                      1502 班次不存在或已停用；1503 格子日期不在该月内；
+     *                      1505 值班电话的周起始日不是周一；1506 该周与本月没有交集
+     */
+    @Transactional
+    public SaveDraftResultVO saveDraft(String yearMonth, SaveDraftRequest req, Long operatorId) {
+        YearMonth ym = ScheduleMonths.parse(yearMonth);
+        LocalDate start = ym.atDay(1);
+        LocalDate end = ym.atEndOfMonth();
+
+        for (UpdateEntryRequest entry : req.entries()) {
+            LocalDate workDate = entry.workDate();
+            if (workDate.isBefore(start) || workDate.isAfter(end)) {
+                throw new BizException(1503, "日期不在该月内");
+            }
+            validStaff(entry.staffId());
+            if (entry.shiftCode() != null) {
+                validShift(entry.shiftCode());
+            }
+        }
+        for (DutyPhoneChange duty : req.dutyPhones()) {
+            LocalDate weekStart = duty.weekStart();
+            if (weekStart.getDayOfWeek() != DayOfWeek.MONDAY) {
+                throw new BizException(1505, "值班电话的周起始日必须是周一");
+            }
+            if (weekStart.plusDays(6).isBefore(start) || weekStart.isAfter(end)) {
+                throw new BizException(1506, "该周与本月没有交集");
+            }
+            if (duty.staffId() != null) {
+                validStaff(duty.staffId());
+            }
+        }
+
+        List<YearMonth> months = monthsInvolved(ym, req.dutyPhones());
+        for (YearMonth month : months) {
+            monthRepo.lockMonth(ScheduleMonths.lockKey(month));
+        }
+
+        RuleCalendar calendar = query.calendar(start, end);
+        for (UpdateEntryRequest entry : req.entries()) {
+            writeEntry(yearMonth, entry, operatorId, calendar);
+        }
+        for (DutyPhoneChange duty : req.dutyPhones()) {
+            writeDutyPhone(duty, operatorId);
+        }
+        // 这里统一打回草稿，写每格时不单独 markDraft：整批只动一次 schedule_month
+        for (YearMonth month : months) {
+            markDraft(keyOf(month));
+        }
+
+        opLog.record(OpAction.SAVE_DRAFT, yearMonth,
+                req.entries().size() + "格，值班电话" + req.dutyPhones().size() + "周");
+        return new SaveDraftResultVO(req.entries().size(), req.dutyPhones().size());
+    }
+
+    /**
+     * 写一周的值班电话草稿并留痕：{@code staffId=null} 是清除该周，库里没有这一行时不去删。
+     *
+     * <p>跨月那一周只有主键为周一的这一行，上个月、本月各自暂存时改的是同一行，
+     * 所以谁最后暂存谁说了算（与 §8.5 发布的口径一致）。</p>
+     */
+    private void writeDutyPhone(DutyPhoneChange duty, Long operatorId) {
+        LocalDate weekStart = duty.weekStart();
+        String target = "值班电话 " + weekStart.format(MONTH_DAY) + " 周";
+        if (duty.staffId() == null) {
+            if (dutyRepo.existsById(weekStart)) {
+                dutyRepo.deleteById(weekStart);
+            }
+            opLog.record(OpAction.SET_DUTY_PHONE, target, "清除");
+            return;
+        }
+        Staff staff = validStaff(duty.staffId());
+        DutyPhoneWeek week = dutyRepo.findById(weekStart).orElseGet(() -> {
+            DutyPhoneWeek created = new DutyPhoneWeek();
+            created.setWeekStart(weekStart);
+            return created;
+        });
+        week.setStaffId(staff.getId());
+        week.setUpdatedBy(operatorId);
+        week.setUpdatedAt(OffsetDateTime.now(clock));
+        dutyRepo.save(week);
+        opLog.record(OpAction.SET_DUTY_PHONE, target, staff.getName());
+    }
+
+    /**
+     * 本次暂存涉及的月份：接口路径上的月份，加上每个值班电话周跨到的月份（跨月那周会带出相邻月），
+     * 去重升序——取锁和打回草稿用的是同一份，顺序必须固定，否则与相邻月份的暂存互相死锁。
+     */
+    private static List<YearMonth> monthsInvolved(YearMonth ym, List<DutyPhoneChange> dutyPhones) {
+        TreeSet<YearMonth> months = new TreeSet<>();
+        months.add(ym);
+        for (DutyPhoneChange duty : dutyPhones) {
+            months.addAll(ScheduleMonths.monthsOfWeek(duty.weekStart()));
+        }
+        return List.copyOf(months);
+    }
+
+    /** {@link YearMonth} 还原成 {@code schedule_month} 的主键写法，如 {@code 2026-10} */
+    private static String keyOf(YearMonth ym) {
+        return String.format("%04d-%02d", ym.getYear(), ym.getMonthValue());
+    }
+
+    /**
+     * 人员必须存在、启用且参与排班（值班电话只能从可排班名单里选，设计 §8.1 第 3 条）。
+     *
+     * @throws BizException code=1501 人员不存在或不参与排班
+     */
+    private Staff validStaff(Long staffId) {
+        return staffRepo.findById(staffId)
+                .filter(s -> s.isActive() && s.isSchedulable())
+                .orElseThrow(() -> new BizException(1501, "人员不存在或不参与排班"));
+    }
+
+    /**
+     * 班次必须存在且启用：已停用的班种不能再排进排班表。
+     *
+     * @throws BizException code=1502 班次不存在或已停用
+     */
+    private ShiftType validShift(String shiftCode) {
+        return shiftRepo.findById(shiftCode).filter(ShiftType::isEnabled)
+                .orElseThrow(() -> new BizException(1502, "班次不存在或已停用"));
     }
 
     /**

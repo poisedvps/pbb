@@ -9,8 +9,11 @@ import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.dto.CellChange;
 import com.hospital.pbb.schedule.dto.CellVO;
+import com.hospital.pbb.schedule.dto.DutyPhoneChange;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
 import com.hospital.pbb.schedule.dto.PublishResultVO;
+import com.hospital.pbb.schedule.dto.SaveDraftRequest;
+import com.hospital.pbb.schedule.dto.SaveDraftResultVO;
 import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
@@ -812,5 +815,217 @@ class ScheduleServiceTest {
         order.verify(entryRepo, times(3)).save(any(ScheduleEntry.class));
         verify(monthRepo, times(1)).lockMonth(LOCK_KEY);
         verify(monthRepo, times(1)).lockMonth(NOV_LOCK_KEY);
+    }
+
+    // ---------- saveDraft（任务单 M4-09：暂存）----------
+
+    /** 2026-10-05 是周一，且整周都在 10 月内（10-05..10-11） */
+    private static final LocalDate WEEK_IN_OCT = LocalDate.of(2026, 10, 5);
+    /** 2026-09-28 是周一，但整周跨了 9、10 月 */
+    private static final LocalDate WEEK_SEP_OCT = LocalDate.of(2026, 9, 28);
+    private static final int SEP_LOCK_KEY = 202609;
+
+    /** 用例：2 个格子 + 1 周（10-05，人员1）→ 两格 manual=true，duty_phone_week 存 10-05/人员1，10 月 DRAFT，返回 {2,1} */
+    @Test
+    void saveDraftWritesEntriesAndDutyPhoneInOneShot() {
+        SaveDraftResultVO result = service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "N", null),
+                        new UpdateEntryRequest(1L, D10, "Z", "顶班")),
+                List.of(new DutyPhoneChange(WEEK_IN_OCT, 1L))), OPERATOR);
+
+        assertEquals(new SaveDraftResultVO(2, 1), result);
+        Map<String, ScheduleEntry> saved = savedEntries();
+        assertEquals(2, saved.size());
+        assertEquals("N", saved.get("1|" + D5).getShiftCode());
+        assertTrue(saved.get("1|" + D5).isManual());
+        assertEquals("Z", saved.get("1|" + D10).getShiftCode());
+        assertEquals("顶班", saved.get("1|" + D10).getRemark());
+        assertEquals(OPERATOR, saved.get("1|" + D5).getUpdatedBy());
+        assertEquals(NOW, saved.get("1|" + D5).getUpdatedAt());
+        // 整批只把涉及的月份打回一次草稿，不是每格一次
+        assertEquals(YM, savedMonth().getYearMonth());
+        assertEquals(ScheduleStatus.DRAFT, savedMonth().getStatus());
+
+        ArgumentCaptor<DutyPhoneWeek> captor = ArgumentCaptor.forClass(DutyPhoneWeek.class);
+        verify(dutyRepo).save(captor.capture());
+        DutyPhoneWeek week = captor.getValue();
+        assertEquals(WEEK_IN_OCT, week.getWeekStart());
+        assertEquals(1L, week.getStaffId());
+        assertEquals(OPERATOR, week.getUpdatedBy());
+        assertEquals(NOW, week.getUpdatedAt());
+
+        verify(opLog).record(OpAction.UPDATE_SCHEDULE, "人员1 10-05", " → N");
+        verify(opLog).record(OpAction.UPDATE_SCHEDULE, "人员1 10-10", " → Z");
+        verify(opLog).record(OpAction.SET_DUTY_PHONE, "值班电话 10-05 周", "人员1");
+        verify(opLog).record(OpAction.SAVE_DRAFT, YM, "2格，值班电话1周");
+    }
+
+    /** 用例：1 个格子 shiftCode=null，该月 cycleTemplateId 指向全 N 模板 → 该格为 N、manual=false */
+    @Test
+    void saveDraftRecomputesDefaultFromMonthTemplateWhenCodeNull() {
+        ScheduleMonth recorded = month(ScheduleStatus.PUBLISHED, 1);
+        recorded.setCycleTemplateId(2L);
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(recorded));
+        when(templateRepo.findById(2L)).thenReturn(Optional.of(allN(2L, "全白班")));
+
+        service.saveDraft(YM, new SaveDraftRequest(List.of(new UpdateEntryRequest(1L, D10, null, null)), List.of()),
+                OPERATOR);
+
+        ScheduleEntry saved = savedEntries().get("1|" + D10);
+        assertEquals("N", saved.getShiftCode());   // 10-10 周六按模板排 N，不是内置规则的 X
+        assertFalse(saved.isManual());
+    }
+
+    /** 用例：第 2 个格子日期是 11-01 → 1503，第 1 个格子也不写（校验全部在前，一条不合法就全批不写） */
+    @Test
+    void saveDraftRejectsEntryOutsideMonthAndWritesNothing() {
+        BizException e = assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "N", null),
+                        new UpdateEntryRequest(1L, LocalDate.of(2026, 11, 1), "N", null)),
+                List.of(new DutyPhoneChange(WEEK_IN_OCT, 1L))), OPERATOR));
+
+        assertEquals(1503, e.getCode());
+        assertNothingWritten();
+    }
+
+    /** 用例：整批里有一格人员无效或班次停用 → 1501 / 1502，同样一格不写 */
+    @Test
+    void saveDraftRejectsInvalidStaffOrShiftInBatchAndWritesNothing() {
+        when(staffRepo.findById(99L)).thenReturn(Optional.empty());
+        assertEquals(1501, assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "N", null),
+                        new UpdateEntryRequest(99L, D10, "N", null)), List.of()), OPERATOR)).getCode());
+        assertNothingWritten();
+
+        when(shiftRepo.findById("Q")).thenReturn(Optional.empty());
+        assertEquals(1502, assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "Q", null)), List.of()), OPERATOR)).getCode());
+        assertNothingWritten();
+
+        when(shiftRepo.findById("L")).thenReturn(Optional.of(shift("L", false)));
+        assertEquals(1502, assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "L", null)), List.of()), OPERATOR)).getCode());
+        assertNothingWritten();
+    }
+
+    /** 用例：值班电话 weekStart=10-06（周二）→ 1505 */
+    @Test
+    void saveDraftRejectsWeekStartNotMonday() {
+        BizException e = assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(), List.of(new DutyPhoneChange(LocalDate.of(2026, 10, 6), 1L))), OPERATOR));
+
+        assertEquals(1505, e.getCode());
+        assertEquals("值班电话的周起始日必须是周一", e.getMessage());
+        assertNothingWritten();
+    }
+
+    /** 用例：weekStart=11-02（周日以后才是本月，整周与 10 月无交集）→ 1506 */
+    @Test
+    void saveDraftRejectsWeekNotOverlappingMonth() {
+        BizException e = assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(), List.of(new DutyPhoneChange(LocalDate.of(2026, 11, 2), 1L))), OPERATOR));
+
+        assertEquals(1506, e.getCode());
+        assertEquals("该周与本月没有交集", e.getMessage());
+        assertNothingWritten();
+    }
+
+    /** 用例：weekStart=2026-09-28 → 依次 lockMonth(202609)、lockMonth(202610)，9 月和 10 月都打回 DRAFT */
+    @Test
+    void saveDraftLocksAndMarksEveryMonthTheWeeksTouch() {
+        SaveDraftResultVO result = service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "N", null)),
+                List.of(new DutyPhoneChange(WEEK_SEP_OCT, 1L))), OPERATOR);
+
+        assertEquals(new SaveDraftResultVO(1, 1), result);
+        InOrder order = inOrder(monthRepo, entryRepo, dutyRepo);
+        order.verify(monthRepo).lockMonth(SEP_LOCK_KEY);
+        order.verify(monthRepo).lockMonth(LOCK_KEY);
+        order.verify(entryRepo).save(any(ScheduleEntry.class));
+        order.verify(dutyRepo).save(any(DutyPhoneWeek.class));
+        verify(monthRepo, times(1)).lockMonth(SEP_LOCK_KEY);
+        verify(monthRepo, times(1)).lockMonth(LOCK_KEY);
+
+        ArgumentCaptor<ScheduleMonth> captor = ArgumentCaptor.forClass(ScheduleMonth.class);
+        verify(monthRepo, times(2)).save(captor.capture());
+        assertEquals(List.of("2026-09", "2026-10"),
+                captor.getAllValues().stream().map(ScheduleMonth::getYearMonth).toList());
+        for (ScheduleMonth saved : captor.getAllValues()) {
+            assertEquals(ScheduleStatus.DRAFT, saved.getStatus(), saved.getYearMonth());
+        }
+        verify(opLog).record(OpAction.SET_DUTY_PHONE, "值班电话 09-28 周", "人员1");
+    }
+
+    /** 用例：weekStart=10-05、staffId=null 且库里已有该周 → 该周被删除，日志 detail 为“清除” */
+    @Test
+    void saveDraftClearsExistingDutyPhoneWeek() {
+        when(dutyRepo.existsById(WEEK_IN_OCT)).thenReturn(true);
+
+        SaveDraftResultVO result = service.saveDraft(YM, new SaveDraftRequest(List.of(),
+                List.of(new DutyPhoneChange(WEEK_IN_OCT, null))), OPERATOR);
+
+        assertEquals(new SaveDraftResultVO(0, 1), result);
+        verify(dutyRepo).deleteById(WEEK_IN_OCT);
+        verify(dutyRepo, never()).save(any(DutyPhoneWeek.class));
+        verify(opLog).record(OpAction.SET_DUTY_PHONE, "值班电话 10-05 周", "清除");
+        verify(opLog).record(OpAction.SAVE_DRAFT, YM, "0格，值班电话1周");
+        assertEquals(ScheduleStatus.DRAFT, savedMonth().getStatus());
+    }
+
+    /** 库里本来就没有这一周 → 不去删，但同样算“清除”并打回草稿 */
+    @Test
+    void saveDraftSkipsDeleteWhenDutyPhoneWeekAbsent() {
+        service.saveDraft(YM, new SaveDraftRequest(List.of(),
+                List.of(new DutyPhoneChange(WEEK_IN_OCT, null))), OPERATOR);
+
+        verify(dutyRepo, never()).deleteById(any());
+        verify(opLog).record(OpAction.SET_DUTY_PHONE, "值班电话 10-05 周", "清除");
+    }
+
+    /** 用例：值班电话选的人是已停用人员 → 1501，一周也不写 */
+    @Test
+    void saveDraftRejectsDisabledDutyPhoneStaff() {
+        when(staffRepo.findById(2L)).thenReturn(Optional.of(staff(2L, true, false)));
+
+        BizException e = assertThrows(BizException.class, () -> service.saveDraft(YM, new SaveDraftRequest(
+                List.of(new UpdateEntryRequest(1L, D5, "N", null)),
+                List.of(new DutyPhoneChange(WEEK_IN_OCT, 2L))), OPERATOR));
+
+        assertEquals(1501, e.getCode());
+        assertNothingWritten();
+    }
+
+    /** 用例：月份格式不对 → 1500，锁都不取 */
+    @Test
+    void saveDraftRejectsBadMonthFormat() {
+        BizException e = assertThrows(BizException.class, () -> service.saveDraft("202610",
+                new SaveDraftRequest(List.of(new UpdateEntryRequest(1L, D5, "N", null)),
+                        List.of(new DutyPhoneChange(WEEK_IN_OCT, 1L))), OPERATOR));
+
+        assertEquals(1500, e.getCode());
+        verify(monthRepo, never()).lockMonth(LOCK_KEY);
+        assertNothingWritten();
+    }
+
+    /** 暂存只写草稿表与值班电话草稿，已发布快照一律不碰 */
+    @Test
+    void saveDraftNeverTouchesPublishedTables() {
+        service.saveDraft(YM, new SaveDraftRequest(List.of(new UpdateEntryRequest(1L, D5, "N", null)),
+                List.of(new DutyPhoneChange(WEEK_IN_OCT, 1L))), OPERATOR);
+
+        verify(publishedRepo, never()).save(any());
+        verify(publishedRepo, never()).saveAll(any());
+        verify(dutyPublishedRepo, never()).save(any());
+        verify(dutyPublishedRepo, never()).saveAll(any());
+        verify(dutyPublishedRepo, never()).delete(any());
+    }
+
+    /** 暂存的任何一条校验失败都应当“全批不写”：格子、值班电话、月份状态、日志一处都没有变动 */
+    private void assertNothingWritten() {
+        verify(entryRepo, never()).save(any(ScheduleEntry.class));
+        verify(dutyRepo, never()).save(any(DutyPhoneWeek.class));
+        verify(dutyRepo, never()).deleteById(any());
+        verify(monthRepo, never()).save(any(ScheduleMonth.class));
+        verify(opLog, never()).record(anyString(), anyString(), anyString());
     }
 }
