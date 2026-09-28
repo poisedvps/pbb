@@ -14,24 +14,40 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.access.prepost.PreAuthorize;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -63,14 +79,14 @@ class CycleTemplateServiceTest {
 
         PRESET_CODES.forEach(code -> when(shiftRepo.findById(code))
                 .thenReturn(Optional.of(shift(code, true))));
-        when(repo.save(any(CycleTemplate.class))).thenAnswer(inv -> {
+        // 生产代码只走 saveAndFlush：预检查之后要让写入立刻落库，约束冲突才能在方法内被抓到
+        when(repo.saveAndFlush(any(CycleTemplate.class))).thenAnswer(inv -> {
             CycleTemplate saved = inv.getArgument(0);
             if (saved.getId() == null) {
                 saved.setId(11L); // 库里 BIGSERIAL 分配的 id
             }
             return saved;
         });
-        when(repo.saveAndFlush(any(CycleTemplate.class))).thenAnswer(inv -> inv.getArgument(0));
     }
 
     // ---------------------------------------------------------------- 新增
@@ -85,7 +101,7 @@ class CycleTemplateServiceTest {
         assertFalse(vo.isDefault());
 
         ArgumentCaptor<CycleTemplate> captor = ArgumentCaptor.forClass(CycleTemplate.class);
-        verify(repo).save(captor.capture());
+        verify(repo).saveAndFlush(captor.capture());
         assertEquals(List.of("N", "X", "D", "D", "D", "X", "X"), captor.getValue().days());
         assertFalse(captor.getValue().isDefaultTemplate());
         assertEquals(NOW, captor.getValue().getCreatedAt());
@@ -113,7 +129,7 @@ class CycleTemplateServiceTest {
 
         assertEquals(1801, e.getCode());
         assertEquals("模板名称已存在", e.getMessage());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
         verify(opLog, never()).record(any(), any(), any());
     }
 
@@ -126,7 +142,7 @@ class CycleTemplateServiceTest {
 
         assertEquals(1803, e.getCode());
         assertEquals("模板中的班次不存在或已停用", e.getMessage());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
     }
 
     @Test
@@ -137,7 +153,7 @@ class CycleTemplateServiceTest {
                 () -> service.create(request("夜班周期", false, "D", "D", "D", "D", "D", "X", "Z")));
 
         assertEquals(1803, e.getCode());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
     }
 
     /** 部分唯一索引 uq_cycle_template_default 只允许一行 is_default = true：旧的默认必须先落库地被摘掉 */
@@ -152,7 +168,7 @@ class CycleTemplateServiceTest {
         assertFalse(standard.isDefaultTemplate(), "原默认模板要被置为 false");
         InOrder order = inOrder(repo);
         order.verify(repo).saveAndFlush(standard);
-        order.verify(repo).save(any(CycleTemplate.class));
+        order.verify(repo).saveAndFlush(any(CycleTemplate.class)); // 自己的写入也要落库
     }
 
     @Test
@@ -160,7 +176,7 @@ class CycleTemplateServiceTest {
         service.create(request("夜班周期", false, "N", "N", "X", "X", "N", "N", "X"));
 
         verify(repo, never()).findFirstByDefaultTemplateTrue();
-        verify(repo, never()).saveAndFlush(any());
+        verify(repo, times(1)).saveAndFlush(any()); // 只有新建的这条被写入，没有谁的默认被摘掉
     }
 
     /** 一条模板也没有（库里只预置了“标准周期”，但可能被删到只剩非默认）时新建默认不能报错 */
@@ -169,7 +185,7 @@ class CycleTemplateServiceTest {
         when(repo.findFirstByDefaultTemplateTrue()).thenReturn(Optional.empty());
 
         assertTrue(service.create(request("夜班周期", true, "N", "N", "X", "X", "N", "N", "X")).isDefault());
-        verify(repo, never()).saveAndFlush(any());
+        verify(repo, times(1)).saveAndFlush(any()); // 没有旧默认要摘，只写自己这一条
     }
 
     // ---------------------------------------------------------------- 修改
@@ -201,7 +217,7 @@ class CycleTemplateServiceTest {
 
         assertEquals(1800, e.getCode());
         assertEquals("排班周期模板不存在", e.getMessage());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
     }
 
     /** 默认模板是"按规则生成不指定模板"和"恢复规则默认"的依据，不能把它改成非默认 */
@@ -215,7 +231,7 @@ class CycleTemplateServiceTest {
 
         assertEquals(1804, e.getCode());
         assertEquals("至少保留一个默认模板", e.getMessage());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
     }
 
     @Test
@@ -228,7 +244,7 @@ class CycleTemplateServiceTest {
                 () -> service.update(3L, request("标准周期", false, "N", "N", "X", "X", "N", "N", "X")));
 
         assertEquals(1801, e.getCode());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
     }
 
     @Test
@@ -241,7 +257,7 @@ class CycleTemplateServiceTest {
                 () -> service.update(3L, request("夜班周期", false, "N", "N", "L", "X", "N", "N", "X")));
 
         assertEquals(1803, e.getCode());
-        verify(repo, never()).save(any());
+        verify(repo, never()).saveAndFlush(any());
     }
 
     @Test
@@ -257,7 +273,7 @@ class CycleTemplateServiceTest {
         assertFalse(standard.isDefaultTemplate());
         InOrder order = inOrder(repo);
         order.verify(repo).saveAndFlush(standard);
-        order.verify(repo).save(night);
+        order.verify(repo).saveAndFlush(night);
     }
 
     /** 默认模板改自己（仍为默认）不涉及"全表最多一个默认"，不需要动别的模板 */
@@ -269,7 +285,7 @@ class CycleTemplateServiceTest {
         service.update(1L, request("标准周期", true, "D", "D", "D", "D", "D", "D", "X"));
 
         verify(repo, never()).findFirstByDefaultTemplateTrue();
-        verify(repo, never()).saveAndFlush(any());
+        verify(repo, times(1)).saveAndFlush(any()); // 只写它自己这一条，没有别的模板被摘掉默认
     }
 
     // ---------------------------------------------------------------- 删除
@@ -308,6 +324,101 @@ class CycleTemplateServiceTest {
         assertEquals("默认模板不能删除", e.getMessage());
         verify(repo, never()).delete(any());
         verify(opLog, never()).record(any(), any(), any());
+    }
+
+    // -------------------------------------------------- 名称唯一约束兜底（并发）
+
+    /** Hibernate + PostgreSQL 撞唯一约束时的真实异常形状 */
+    private static DataIntegrityViolationException uniqueViolation(String constraint, String column) {
+        SQLException root = new SQLException("ERROR: duplicate key value violates unique constraint \""
+                + constraint + "\"  Detail: Key (" + column + ")=(夜班周期) already exists.", "23505");
+        return new DataIntegrityViolationException("could not execute statement [duplicate key value]",
+                new org.hibernate.exception.ConstraintViolationException(
+                        "duplicate key value violates unique constraint \"" + constraint + "\"", root, constraint));
+    }
+
+    /**
+     * 两个管理员同时新增同名模板：预检查都通过，后提交的一方在 cycle_template.name 的唯一约束上撞下。
+     * 必须转成 1801（不是 500），且不记新增日志。异常链按 Hibernate + PostgreSQL 的真实形状模拟。
+     */
+    @Test
+    void createMapsNameUniqueViolationTo1801() {
+        when(repo.saveAndFlush(any(CycleTemplate.class)))
+                .thenThrow(uniqueViolation(CycleTemplateService.NAME_UNIQUE_CONSTRAINT, "name"));
+
+        BizException e = assertThrows(BizException.class,
+                () -> service.create(request("夜班周期", false, "N", "N", "X", "X", "N", "N", "X")));
+
+        assertEquals(1801, e.getCode());
+        assertEquals("模板名称已存在", e.getMessage());
+        verify(opLog, never()).record(any(), any(), any());
+    }
+
+    /** 修改同理：改完的名字撞上别人也是 1801，不能漏到提交时变 500 */
+    @Test
+    void updateMapsNameUniqueViolationTo1801() {
+        when(repo.findById(3L)).thenReturn(Optional.of(
+                template(3L, "夜班周期", false, "N", "N", "X", "X", "N", "N", "X")));
+        when(repo.saveAndFlush(any(CycleTemplate.class)))
+                .thenThrow(uniqueViolation(CycleTemplateService.NAME_UNIQUE_CONSTRAINT, "name"));
+
+        BizException e = assertThrows(BizException.class,
+                () -> service.update(3L, request("标准周期", false, "N", "N", "X", "X", "N", "N", "X")));
+
+        assertEquals(1801, e.getCode());
+        verify(opLog, never()).record(any(), any(), any());
+    }
+
+    /**
+     * 并发切默认撞 uq_cycle_template_default 也是 23505，但它不是重名，
+     * 不能翻成 1801 把调用方误导到"改个名字"上——这类冲突一律原样抛出。
+     */
+    @Test
+    void defaultIndexViolationIsNotMistakenForADuplicateName() {
+        DataIntegrityViolationException defaultIndex = uniqueViolation("uq_cycle_template_default", "id");
+        when(repo.findFirstByDefaultTemplateTrue()).thenReturn(Optional.of(
+                template(1L, "标准周期", true, "D", "D", "D", "D", "D", "X", "X")));
+        when(repo.saveAndFlush(any(CycleTemplate.class))).thenThrow(defaultIndex);
+
+        DataIntegrityViolationException thrown = assertThrows(DataIntegrityViolationException.class, () ->
+                service.create(request("夜班周期", true, "N", "N", "X", "X", "N", "N", "X")));
+
+        assertSame(defaultIndex, thrown);
+        verify(opLog, never()).record(any(), any(), any());
+    }
+
+    /** 外键一类非唯一约束（这里用 day_codes 的 FK）同样原样抛出，保证事务回滚并能定位到 500 */
+    @Test
+    void otherIntegrityViolationIsRethrown() {
+        SQLException root = new SQLException(
+                "ERROR: insert or update on table \"cycle_template\" violates foreign key constraint \"fk_cycle_template_day_codes\"",
+                "23503");
+        DataIntegrityViolationException fk = new DataIntegrityViolationException("could not execute statement", root);
+        when(repo.saveAndFlush(any(CycleTemplate.class))).thenThrow(fk);
+
+        DataIntegrityViolationException thrown = assertThrows(DataIntegrityViolationException.class, () ->
+                service.create(request("夜班周期", false, "N", "N", "X", "X", "N", "N", "X")));
+
+        assertSame(fk, thrown);
+        verify(opLog, never()).record(any(), any(), any());
+    }
+
+    /**
+     * 真并发：两个线程同时新增同名模板。查重只看得见的已提交行，两边都能通过预检查；
+     * 后落库的一方由内存表里的唯一约束兜底。结局必须是一个成功、一个 1801，表里只剩一行。
+     */
+    @Test
+    void concurrentCreateWithTheSameNameLeavesOneRowAndOne1801() throws Exception {
+        FakeCycleTable table = new FakeCycleTable();
+        CycleTemplateService shared = new CycleTemplateService(table.repository(), shiftRepo, opLog, CLOCK);
+
+        List<Integer> codes = runConcurrently(
+                () -> transaction(table, () -> shared.create(request("夜班周期", false, "N", "N", "X", "X", "N", "N", "X"))),
+                () -> transaction(table, () -> shared.create(request("夜班周期", false, "N", "N", "X", "X", "N", "N", "X"))));
+
+        assertEquals(List.of(0, 1801), codes.stream().sorted().toList(),
+                "同名并发新增只能成一个，另一个要是 1801 而不是 500");
+        assertEquals(1, table.rowCount(), "表里不能留下两行同名模板");
     }
 
     // ---------------------------------------------------------------- 列表与权限
@@ -380,5 +491,171 @@ class CycleTemplateServiceTest {
 
     private static CycleTemplateRequest request(String name, boolean isDefault, String... days) {
         return new CycleTemplateRequest(name, List.of(days), isDefault);
+    }
+
+    /** 一次假事务：成功提交，业务异常回滚并把错误码交给断言；其他异常照旧抛出，在测试里等于 500 */
+    private static int transaction(FakeCycleTable table, Runnable body) {
+        table.begin();
+        try {
+            body.run();
+            table.commit();
+            return 0;
+        } catch (BizException e) {
+            table.rollback();
+            return e.getCode();
+        } catch (RuntimeException e) {
+            table.rollback();
+            throw e;
+        }
+    }
+
+    /** 多个线程同时起跑，返回每个线程的结果 */
+    @SafeVarargs
+    private static List<Integer> runConcurrently(Callable<Integer>... tasks) throws Exception {
+        CyclicBarrier ready = new CyclicBarrier(tasks.length);
+        ExecutorService pool = Executors.newFixedThreadPool(tasks.length);
+        try {
+            List<Future<Integer>> futures = new ArrayList<>();
+            for (Callable<Integer> task : tasks) {
+                futures.add(pool.submit(() -> {
+                    ready.await(5, TimeUnit.SECONDS); // 都准备好后一起开始，不然碰不上并发
+                    return task.call();
+                }));
+            }
+            List<Integer> results = new ArrayList<>();
+            for (Future<Integer> future : futures) {
+                results.add(future.get(30, TimeUnit.SECONDS));
+            }
+            return results;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * 只够用来复现名称竞争的内存表。
+     *
+     * <p>查重只看得见的已提交行，唯一性推迟到 flush 时才判；看见别人正在插同名时先等它落定——
+     * 等价于 PostgreSQL 唯一索引上对未提交键值的等待。有了这个等待，谁先提交谁赢就是确定的，
+     * 不会因线程调度顺序而偶发。</p>
+     */
+    private static final class FakeCycleTable {
+
+        private final Object lock = new Object();
+        private final Map<String, CycleTemplate> committed = new LinkedHashMap<>();
+        /** 正在插入、尚未提交的名称 → 持有它的事务结束时 countDown 的门闩 */
+        private final Map<String, CountDownLatch> inserting = new HashMap<>();
+        private final ThreadLocal<List<CycleTemplate>> writes = ThreadLocal.withInitial(ArrayList::new);
+        private final ThreadLocal<String> heldName = new ThreadLocal<>();
+        private long sequence = 10;
+
+        CycleTemplateRepository repository() {
+            CycleTemplateRepository mock = mock(CycleTemplateRepository.class);
+            when(mock.existsByName(any())).thenAnswer(inv -> existsByName(inv.getArgument(0)));
+            when(mock.saveAndFlush(any(CycleTemplate.class))).thenAnswer(inv -> flush(inv.getArgument(0)));
+            when(mock.findFirstByDefaultTemplateTrue()).thenAnswer(inv -> findDefault());
+            when(mock.findById(any())).thenAnswer(inv -> findById((Long) inv.getArgument(0)));
+            when(mock.findAllByOrderByIdAsc()).thenAnswer(inv -> list());
+            return mock;
+        }
+
+        void begin() {
+            writes.get().clear();
+        }
+
+        void commit() {
+            synchronized (lock) {
+                for (CycleTemplate template : writes.get()) {
+                    if (template.getId() == null) {
+                        template.setId(++sequence); // 库里 BIGSERIAL 分配的 id
+                    }
+                    committed.put(template.getName(), template);
+                }
+                writes.get().clear();
+                releaseHeldName();
+            }
+        }
+
+        void rollback() {
+            synchronized (lock) {
+                writes.get().clear();
+                releaseHeldName();
+            }
+        }
+
+        int rowCount() {
+            synchronized (lock) {
+                return committed.size();
+            }
+        }
+
+        private boolean existsByName(String name) {
+            synchronized (lock) {
+                return committed.containsKey(name)
+                        || writes.get().stream().anyMatch(t -> t.getName().equals(name));
+            }
+        }
+
+        private CycleTemplate flush(CycleTemplate template) {
+            while (true) {
+                CountDownLatch blocking;
+                synchronized (lock) {
+                    if (committed.containsKey(template.getName())) {
+                        throw uniqueViolation(CycleTemplateService.NAME_UNIQUE_CONSTRAINT, "name");
+                    }
+                    blocking = inserting.get(template.getName());
+                    if (blocking == null) {
+                        releaseHeldName(); // 本表每事务最多持一个名称的锁，够用了
+                        inserting.put(template.getName(), new CountDownLatch(1));
+                        heldName.set(template.getName());
+                        writes.get().add(template);
+                        return template;
+                    }
+                }
+                awaitQuietly(blocking); // 同名未提交：等对方落定，和唯一索引上的等待一样
+            }
+        }
+
+        private Optional<CycleTemplate> findDefault() {
+            synchronized (lock) {
+                return committed.values().stream().filter(CycleTemplate::isDefaultTemplate).findFirst();
+            }
+        }
+
+        private Optional<CycleTemplate> findById(Long id) {
+            synchronized (lock) {
+                return id == null ? Optional.empty()
+                        : committed.values().stream().filter(t -> id.equals(t.getId())).findFirst();
+            }
+        }
+
+        private List<CycleTemplate> list() {
+            synchronized (lock) {
+                return committed.values().stream().sorted(Comparator.comparing(CycleTemplate::getId)).toList();
+            }
+        }
+
+        /** 调用方需持有 lock */
+        private void releaseHeldName() {
+            String name = heldName.get();
+            if (name != null) {
+                heldName.remove();
+                CountDownLatch latch = inserting.remove(name);
+                if (latch != null) {
+                    latch.countDown();
+                }
+            }
+        }
+
+        private static void awaitQuietly(CountDownLatch latch) {
+            try {
+                if (!latch.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("等未提交的同名插入落定超时，内存表的名称锁没释放");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
     }
 }

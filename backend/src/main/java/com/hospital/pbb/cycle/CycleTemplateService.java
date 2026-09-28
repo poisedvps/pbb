@@ -7,6 +7,7 @@ import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -26,6 +27,9 @@ import java.util.List;
  */
 @Service
 public class CycleTemplateService {
+
+    /** V2 迁移里 cycle_template.name 的 UNIQUE 约束名 */
+    static final String NAME_UNIQUE_CONSTRAINT = "cycle_template_name_key";
 
     private final CycleTemplateRepository repo;
     private final ShiftTypeRepository shiftRepo;
@@ -61,7 +65,7 @@ public class CycleTemplateService {
         template.setDefaultTemplate(req.isDefault());
         template.setCreatedAt(now);
         template.setUpdatedAt(now);
-        repo.save(template);
+        flushOrNameConflict(template);
 
         opLog.record(OpAction.CREATE_CYCLE, name, detailOf(req.days()));
         return CycleTemplateVO.of(template);
@@ -89,7 +93,7 @@ public class CycleTemplateService {
         template.setDays(req.days());
         template.setDefaultTemplate(req.isDefault());
         template.setUpdatedAt(OffsetDateTime.now(clock));
-        repo.save(template);
+        flushOrNameConflict(template);
 
         opLog.record(OpAction.UPDATE_CYCLE, name, detailOf(req.days()));
         return CycleTemplateVO.of(template);
@@ -108,6 +112,9 @@ public class CycleTemplateService {
 
     /**
      * 名称校验：去首尾空格后查重，返回去空格后的名称（入库和记日志都用它）。
+     *
+     * <p>这里只是“先查”，查重与写入之间没有锁，真正的兜底是 {@code cycle_template.name} 的
+     * UNIQUE 约束，见 {@link #flushOrNameConflict}。</p>
      *
      * @param selfId 修改时传自身 id（改自己不算重名），新增时传 null
      */
@@ -140,6 +147,41 @@ public class CycleTemplateService {
             current.setDefaultTemplate(false);
             repo.saveAndFlush(current);
         });
+    }
+
+    /**
+     * 写入并立即落库。
+     *
+     * <p>必须 flush：预检查到提交之间没有锁，两个同名请求可能都通过 {@code existsByName}，
+     * 后提交的一方在 {@code cycle_template.name} 的 UNIQUE 约束上撞下。flush 让冲突在本方法
+     * 里就被抓到手，翻译成 1801，而不是留到事务提交时变成全局 500。</p>
+     */
+    private void flushOrNameConflict(CycleTemplate template) {
+        try {
+            repo.saveAndFlush(template);
+        } catch (DataIntegrityViolationException e) {
+            if (!isNameConflict(e)) {
+                throw e; // 其他完整性冲突（外键、默认模板唯一索引等）原样抛出，事务照常回滚
+            }
+            throw new BizException(1801, "模板名称已存在");
+        }
+    }
+
+    /**
+     * 只认 {@code cycle_template.name} 的唯一约束冲突：异常链里出现该约束名才算。
+     *
+     * <p>光看 SQLState 23505 不够：{@code uq_cycle_template_default} 撞的也是 23505，
+     * 那是并发切默认模板，不是重名，翻成 1801 会把调用方引导到错误的修法。其余完整性冲突
+     * （外键、非空、默认模板唯一索引）一律返回 false，由调用方原样抛出。</p>
+     */
+    private static boolean isNameConflict(DataIntegrityViolationException e) {
+        for (Throwable t = e; t != null && t != t.getCause(); t = t.getCause()) {
+            String msg = t.getMessage();
+            if (msg != null && msg.contains(NAME_UNIQUE_CONSTRAINT)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private CycleTemplate load(Long id) {
