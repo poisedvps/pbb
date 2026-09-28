@@ -108,6 +108,23 @@ print("" if node is None else node)
 ' "$1" "$2" "$3" "$4"
 }
 
+# jfirstmon ← 标准输入读月视图，输出该月第一个「非节假日周一」（weekday=1 且 kind=WORKDAY）。
+# 按模板生成时，放假日永远压过模板（RuleCalendar.defaultShift），所以要避开节假日取那一格。
+jfirstmon() {
+  python3 -c '
+import json, sys
+
+try:
+    days = json.load(sys.stdin)["data"]["days"]
+except Exception:
+    days = []
+for day in days or []:
+    if isinstance(day, dict) and day.get("weekday") == 1 and day.get("kind") == "WORKDAY":
+        print(day.get("date") or "")
+        break
+'
+}
+
 # code_of BODY → 响应体里的 code（错误原因只打印 code+message，绝不回显整个响应体）
 err_of() {
   echo "code=$(printf '%s' "$1" | jget code) message=$(printf '%s' "$1" | jget message)"
@@ -249,12 +266,109 @@ APPROVED="$(api POST "/api/swaps/${SWAP_ID}/approve" "$TOKEN" '{"comment":"冒�
   || fail "状态应为 APPROVED，实际 $(printf '%s' "$APPROVED" | jget data.status)"
 pass
 
+# ---------------------------------------------------------------- 步骤 M4-a
+# M4 新功能（排班周期模板、暂存值班电话、底色设置）统一排在统计步骤之前，统计步骤里再校验值班电话天数
+STEP="M4-a 排班周期模板：列表含“标准周期”、新建 SMK 周期"
+TEMPLATES="$(api GET /api/cycle-templates "$TOKEN")"
+[ "$(printf '%s' "$TEMPLATES" | jget code)" = "0" ] || fail "查模板列表失败：$(err_of "$TEMPLATES")"
+STD_ID="$(printf '%s' "$TEMPLATES" | jpick data name 标准周期 id)"
+[ -n "$STD_ID" ] || fail "模板列表里没有内置的“标准周期”：$(err_of "$TEMPLATES")"
+
+TPL_NAME="SMK周期${TS}"
+TPL_CREATED="$(api POST /api/cycle-templates "$TOKEN" \
+  "{\"name\":\"${TPL_NAME}\",\"days\":[\"N\",\"X\",\"D\",\"D\",\"D\",\"X\",\"X\"],\"isDefault\":false}")"
+[ "$(printf '%s' "$TPL_CREATED" | jget code)" = "0" ] || fail "新建模板失败：$(err_of "$TPL_CREATED")"
+TPL_ID="$(printf '%s' "$TPL_CREATED" | jget data.id)"
+[ -n "$TPL_ID" ] || fail "响应里没有 data.id"
+# 周一 N、周二 X、周三至周五 D、周六日 X（jget 支持 days.0 这样的下标）
+for pair in 0=N 1=X 2=D 3=D 4=D 5=X 6=X; do
+  idx="${pair%%=*}"; want="${pair##*=}"
+  got="$(printf '%s' "$TPL_CREATED" | jget "data.days.${idx}")"
+  [ "$got" = "$want" ] || fail "模板 days[$idx] 应为 $want，实际 ${got:-空}"
+done
+[ "$(printf '%s' "$TPL_CREATED" | jget data.isDefault)" = "false" ] || fail "新模板不应当是默认模板"
+pass
+
+# ---------------------------------------------------------------- 步骤 M4-b
+STEP="M4-b 按模板 ${TPL_NAME} 生成 ${NM}"
+GENERATED="$(api POST "/api/schedules/${NM}/generate?templateId=${TPL_ID}" "$TOKEN")"
+[ "$(printf '%s' "$GENERATED" | jget code)" = "0" ] || fail "按模板生成失败：$(err_of "$GENERATED")"
+
+M4MONTH="$(api GET "/api/schedules/${NM}" "$TOKEN")"
+[ "$(printf '%s' "$M4MONTH" | jget code)" = "0" ] || fail "查月视图失败：$(err_of "$M4MONTH")"
+USED_ID="$(printf '%s' "$M4MONTH" | jget data.cycleTemplateId)"
+[ "$USED_ID" = "$TPL_ID" ] || fail "data.cycleTemplateId=${USED_ID:-空}，应为 ${TPL_ID}"
+
+# 模板周一是 N；放假日永远排休息，所以取该月第一个非节假日的周一那一格
+RULE_MON="$(printf '%s' "$M4MONTH" | jfirstmon)"
+[ -n "$RULE_MON" ] || fail "${NM} 里找不到非节假日的周一，无法校验模板班次"
+MON_CODE="$(printf '%s' "$M4MONTH" | jpick data.rows staffId "$SID_A" "cells.${RULE_MON}.shiftCode")"
+[ "$MON_CODE" = "N" ] || fail "${RULE_MON}（周一）按模板应为 N，实际 ${MON_CODE:-空}"
+pass
+
+# ---------------------------------------------------------------- 步骤 M4-c
+# 值班电话按周存，取「NM 月内第一个周一」为 weekStart：最晚也是 7 号，整周必然落在 NM 内，统计才能算满 7 天
+FIRST_MON="$(printf '%s' "$NM" | python3 -c \
+  'import sys, datetime; d = datetime.date.fromisoformat(sys.stdin.read().strip() + "-01"); print(d + datetime.timedelta(days=(7 - d.weekday()) % 7))')"
+STEP="M4-c 暂存：甲 ${NM}-16 改值班、${FIRST_MON} 周由甲接值班电话"
+# duty_phone_week 以周一为主键，不带时间戳：重跑脚本时上一轮可能已经把同一周分给了另一个冒烟甲。
+# 先把这一周从草稿与已发布快照里都抹掉（staffId=null 是清除，再发布一次），M4-d 的“发布前看不到”才真是从零开始。
+CLEARED="$(api PUT "/api/schedules/${NM}/draft" "$TOKEN" \
+  "{\"entries\":[],\"dutyPhones\":[{\"weekStart\":\"${FIRST_MON}\",\"staffId\":null}]}")"
+[ "$(printf '%s' "$CLEARED" | jget code)" = "0" ] || fail "预清这一周的值班电话失败：$(err_of "$CLEARED")"
+RESET="$(api POST "/api/schedules/${NM}/publish" "$TOKEN")"
+[ "$(printf '%s' "$RESET" | jget code)" = "0" ] || fail "预清后发布失败：$(err_of "$RESET")"
+
+DRAFT="$(api PUT "/api/schedules/${NM}/draft" "$TOKEN" \
+  "{\"entries\":[{\"staffId\":${SID_A},\"workDate\":\"${NM}-16\",\"shiftCode\":\"Z\",\"remark\":\"\"}],\"dutyPhones\":[{\"weekStart\":\"${FIRST_MON}\",\"staffId\":${SID_A}}]}")"
+[ "$(printf '%s' "$DRAFT" | jget code)" = "0" ] || fail "暂存失败：$(err_of "$DRAFT")"
+[ "$(printf '%s' "$DRAFT" | jget data.entries)" = "1" ] \
+  || fail "data.entries 应为 1，实际 $(printf '%s' "$DRAFT" | jget data.entries)"
+[ "$(printf '%s' "$DRAFT" | jget data.dutyPhones)" = "1" ] \
+  || fail "data.dutyPhones 应为 1，实际 $(printf '%s' "$DRAFT" | jget data.dutyPhones)"
+pass
+
+# ---------------------------------------------------------------- 步骤 M4-d
+STEP="M4-d 值班电话：发布前成员看不到，发布后看得到本人"
+DUTY_BEFORE="$(api GET "/api/schedules/${NM}" "$MA" | jpick data.dutyPhones weekStart "$FIRST_MON" staffId)"
+[ -z "$DUTY_BEFORE" ] \
+  || fail "暂存还没发布，甲却看到 ${FIRST_MON} 周的值班电话是 ${DUTY_BEFORE}"
+
+PUBLISHED_DUTY="$(api POST "/api/schedules/${NM}/publish" "$TOKEN")"
+[ "$(printf '%s' "$PUBLISHED_DUTY" | jget code)" = "0" ] || fail "发布失败：$(err_of "$PUBLISHED_DUTY")"
+
+DUTY_AFTER="$(api GET "/api/schedules/${NM}" "$MA")"
+DUTY_STAFF="$(printf '%s' "$DUTY_AFTER" | jpick data.dutyPhones weekStart "$FIRST_MON" staffId)"
+[ "$DUTY_STAFF" = "$SID_A" ] || fail "发布后甲查不到 ${FIRST_MON} 周的值班电话，实际 staffId=${DUTY_STAFF:-空}"
+DUTY_NAME="$(printf '%s' "$DUTY_AFTER" | jpick data.dutyPhones weekStart "$FIRST_MON" name)"
+[ "$DUTY_NAME" = "冒烟甲" ] || fail "${FIRST_MON} 周值班电话姓名应为冒烟甲，实际 ${DUTY_NAME:-空}"
+pass
+
+# ---------------------------------------------------------------- 步骤 M4-f
+STEP="M4-f 值班电话底色改成 #fdba74 再改回 #fde047，最后删掉测试模板"
+COLOR="$(api PUT /api/settings/duty-phone-color "$TOKEN" '{"color":"#fdba74"}')"
+[ "$(printf '%s' "$COLOR" | jget code)" = "0" ] || fail "改底色失败：$(err_of "$COLOR")"
+[ "$(printf '%s' "$COLOR" | jget data.color)" = "#fdba74" ] \
+  || fail "返回的底色不是 #fdba74：$(printf '%s' "$COLOR" | jget data.color)"
+REVERTED="$(api PUT /api/settings/duty-phone-color "$TOKEN" '{"color":"#fde047"}')"
+[ "$(printf '%s' "$REVERTED" | jget data.color)" = "#fde047" ] \
+  || fail "底色没改回去：$(err_of "$REVERTED")"
+
+# 模板只服务于生成，用完删掉；schedule_month 上的引用由外键自动置空
+DELETED="$(api DELETE "/api/cycle-templates/${TPL_ID}" "$TOKEN")"
+[ "$(printf '%s' "$DELETED" | jget code)" = "0" ] || fail "删除测试模板失败：$(err_of "$DELETED")"
+pass
+
 # ---------------------------------------------------------------- 步骤 8
 STEP="8 统计与导出"
 # 末日：把 1 号推到下个月再退一天，正好是 NM 的最后一天
 LAST_DAY="$(date -v1d -v+2m -v-1d +%Y-%m-%d)"
 STATS="$(api GET "/api/stats?from=${NM}-01&to=${LAST_DAY}" "$TOKEN")"
 [ "$(printf '%s' "$STATS" | jget code)" = "0" ] || fail "统计失败：$(err_of "$STATS")"
+
+# M4-e：甲值班的 ${FIRST_MON} 那一周整周都在 ${NM} 内，值班电话天数必然是 7
+DUTY_DAYS="$(printf '%s' "$STATS" | jpick data.rows staffId "$SID_A" dutyPhoneDays)"
+[ "$DUTY_DAYS" = "7" ] || fail "甲的 dutyPhoneDays 应为 7，实际 ${DUTY_DAYS:-空}"
 
 META="$(http_meta GET "/api/stats/export?from=${NM}-01&to=${LAST_DAY}" "$TOKEN")"
 [ "${META%% *}" = "200" ] || fail "统计导出 HTTP=${META%% *}"
