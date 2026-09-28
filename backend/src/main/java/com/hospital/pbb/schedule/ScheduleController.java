@@ -5,6 +5,8 @@ import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.GenerateResultVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.PublishResultVO;
+import com.hospital.pbb.schedule.dto.SaveDraftRequest;
+import com.hospital.pbb.schedule.dto.SaveDraftResultVO;
 import com.hospital.pbb.schedule.dto.UpdateEntryRequest;
 import com.hospital.pbb.user.AuthUser;
 import com.hospital.pbb.user.Role;
@@ -72,5 +74,19 @@ public class ScheduleController {
     @PreAuthorize("hasRole('ADMIN')")
     public ApiResponse<PublishResultVO> publish(@PathVariable String yearMonth, @AuthenticationPrincipal AuthUser me) {
         return ApiResponse.ok(scheduleService.publish(yearMonth, me.id()));
+    }
+
+    /**
+     * 暂存：把页面上改过的全部格子与值班电话一次性存回草稿（设计 §8.5）。
+     *
+     * <p>整批要么全存要么全不存，所以前端不需要逐格调 {@code PUT /{yearMonth}/entries}；
+     * 暂存只动草稿，成员与大屏仍要看【发布】后的版本。</p>
+     */
+    @PutMapping("/{yearMonth}/draft")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ApiResponse<SaveDraftResultVO> saveDraft(@PathVariable String yearMonth,
+                                                    @Valid @RequestBody SaveDraftRequest req,
+                                                    @AuthenticationPrincipal AuthUser me) {
+        return ApiResponse.ok(scheduleService.saveDraft(yearMonth, req, me.id()));
     }
 }
