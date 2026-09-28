@@ -429,3 +429,353 @@ describe('M4-14 暂存', () => {
     expect(pendingTds(wrapper)).toHaveLength(0)
   })
 })
+
+// ============================================================================
+// M4-15 值班电话（设计 §8.1 第 3 条、§8.5「标亮」）
+// 上面的 helper 用的是 6 天小月且只喂 2026-09，这里要整月数据、跨月周与多个月份，
+// 所以另起一套；上面 17 条断言一字未改。
+// ============================================================================
+const DUTY_YELLOW = 'rgb(253, 224, 71)' // 默认底色 #fde047
+const DUTY_ORANGE = 'rgb(249, 115, 22)' // #f97316
+
+// 整月 days/cells：weekday 走 UTC 算，机器时区不同也不会把日期算错一天
+const dutyDaysOf = (ym) => {
+  const [y, m] = ym.split('-').map(Number)
+  const n = new Date(y, m, 0).getDate()
+  return Array.from({ length: n }, (_, i) => {
+    const wd = new Date(Date.UTC(y, m - 1, i + 1)).getUTCDay()
+    return {
+      date: `${ym}-${String(i + 1).padStart(2, '0')}`,
+      weekday: wd === 0 ? 7 : wd,
+      kind: wd >= 6 ? 'WEEKEND' : 'WORKDAY',
+      holidayName: null
+    }
+  })
+}
+const dutyCellsOf = (ym, code) =>
+  Object.fromEntries(dutyDaysOf(ym).map((d) => [d.date, { shiftCode: code, manual: false, remark: null }]))
+
+// 成员看到的 dutyPhones 就是已发布那一份（后端负口径），这里直接只喂已发布的那几条
+const dutyMonthOf = (ym, { dutyPhones = [], color = '#fde047', draft = true, status = 'DRAFT' } = {}) => ({
+  yearMonth: ym,
+  status,
+  version: 1,
+  publishedAt: null,
+  draft,
+  days: dutyDaysOf(ym),
+  rows: [
+    { staffId: 1, empNo: 'A01', name: '张三', position: '医生', cells: dutyCellsOf(ym, 'D') },
+    { staffId: 2, empNo: 'A02', name: '李四', position: '医生', cells: dutyCellsOf(ym, 'D') }
+  ],
+  cycleTemplateId: 1,
+  dutyPhoneColor: color,
+  dutyPhones
+})
+const dutyRow = (weekStart, weekEnd, staffId, name) => ({ weekStart, weekEnd, staffId, name })
+
+// 翻到目标月：组件的初始月份是「跑测试这天的当月」，靠‹ › 翻，测试与机器日期无关
+const dutyMonthNo = (label) => {
+  const m = /(\d{4})年(\d{1,2})月/.exec(label.replace(/\s/g, ''))
+  return m ? Number(m[1]) * 12 + Number(m[2]) - 1 : NaN
+}
+const goDutyMonth = async (wrapper, target) => {
+  const want = Number(target.slice(0, 4)) * 12 + Number(target.slice(5, 7)) - 1
+  for (let i = 0; i < 48 && dutyMonthNo(wrapper.find('.month').text()) !== want; i++) {
+    await click(btnByText(dutyMonthNo(wrapper.find('.month').text()) < want ? '›' : '‹'))
+  }
+  if (dutyMonthNo(wrapper.find('.month').text()) !== want) throw new Error('翻不到 ' + target)
+}
+
+// 吊住某个月不返回，用来复现切月请求在途时的竞态；arm() 才生效，
+// 否则前面用 ‹ › 翻页时路过那个月就卡住了
+const dutyHeld = new Map()
+let lastDuty = null
+const mountDuty = async ({ admin = true, ym = '2026-10', months = {} } = {}) => {
+  dutyHeld.clear()
+  const armed = new Set()
+  getSchedule.mockReset().mockImplementation((target) => {
+    if (armed.has(target)) {
+      return new Promise((resolve) => dutyHeld.set(target, () => resolve(months[target] || dutyMonthOf(target))))
+    }
+    return Promise.resolve(months[target] || dutyMonthOf(target))
+  })
+  saveDraft.mockClear().mockResolvedValue({ entries: 0, dutyPhones: 0 })
+  publishSchedule.mockReset().mockResolvedValue({ version: 3, count: 10 })
+  generateSchedule.mockClear()
+  ElMessageBox.confirm.mockClear().mockResolvedValue('confirm')
+  ElMessageBox.alert.mockClear()
+  ElMessage.success.mockClear()
+  ElMessage.warning.mockClear()
+  ElMessage.info.mockClear()
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  const auth = useAuthStore()
+  auth.user = { id: 1, username: admin ? 'admin' : 'member', role: admin ? 'ADMIN' : 'MEMBER' }
+  const router = buildRouter()
+  await router.push('/')
+  await router.isReady()
+  const wrapper = mount(defineComponent({ render: () => h(RouterView) }), {
+    attachTo: document.body,
+    global: { plugins: [pinia, router, ElementPlus] }
+  })
+  await flushPromises()
+  lastDuty = wrapper
+  await goDutyMonth(wrapper, ym)
+  return {
+    wrapper,
+    router,
+    auth,
+    // 把某个月的 GET 吊住；release() 再放它落地
+    arm: (target) => armed.add(target),
+    release: async (target) => {
+      dutyHeld.get(target)?.()
+      dutyHeld.delete(target)
+      await flushPromises()
+    }
+  }
+}
+afterEach(() => {
+  lastDuty?.unmount()
+  lastDuty = null
+})
+
+// 值班电话一行的周标签，顺序与选择器一致
+const dutyWeekLabels = (wrapper) => wrapper.findAll('.duty .wk-no').map((e) => e.text())
+const dutySelects = (wrapper) => wrapper.findAllComponents({ name: 'ElSelect' })
+// 选人与清空走组件契约：el-select 的弹层 teleport 到 body 且五个下拉共用同一层 DOM，
+// 靠定位弹层项去点会隔空命中另一个选择器；选中和 clearable 清空对外发的就是这个事件
+const pickDuty = async (select, staffId) => {
+  select.vm.$emit('update:modelValue', staffId)
+  await flushPromises()
+}
+// 表体某一行的日期格（去掉姓名列），下标 = 日 - 1
+const dutyRowTds = (wrapper, rowIndex) => wrapper.findAll('tbody tr')[rowIndex].findAll('td').slice(1)
+const dutyBg = (td) => (td.attributes('style') || '').replace(/\s+/g, ' ')
+const dayCol = (day) => day - 1
+
+describe('M4-15 值班电话', () => {
+  it('2026-10 的周选择器：5 个，第一个是跨月的 9/28–10/4', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    expect(dutyWeekLabels(wrapper)).toEqual(['9/28–10/4', '10/5–10/11', '10/12–10/18', '10/19–10/25', '10/26–11/1'])
+    expect(dutySelects(wrapper)).toHaveLength(5)
+    for (const s of dutySelects(wrapper)) expect(s.props('modelValue')).toBeNull() // 全部未设置
+    // 选项就是当前参与排班的人员，显示姓名
+    expect(dutySelects(wrapper)[0].findAllComponents({ name: 'ElOption' }).map((o) => o.props('label'))).toEqual([
+      '张三',
+      '李四'
+    ])
+  })
+
+  it('选 9/28–10/4 = 张三：张三本月 4 格立即变黄，班次文字不变，暂存计数 +1', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await pickDuty(dutySelects(wrapper)[0], 1)
+    const zhang = dutyRowTds(wrapper, 0)
+    for (const i of [0, 1, 2, 3]) expect(dutyBg(zhang[i])).toContain(DUTY_YELLOW) // 10-01~10-04 整格黄底
+    expect(dutyBg(zhang[4])).not.toContain(DUTY_YELLOW) // 10-05 属于下一周
+    expect(dutyBg(dutyRowTds(wrapper, 1)[0])).not.toContain(DUTY_YELLOW) // 李四不受影响
+    expect(zhang[0].text()).toBe('白班') // 班次文字照常显示
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    expect(saveDraft).not.toHaveBeenCalled() // 选择只写页面，不发请求
+  })
+
+  it('同一周重复选同一个人不重复计数；换人就是覆盖', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    const s = dutySelects(wrapper)[1] // 10/5–10/11
+    await pickDuty(s, 1)
+    await pickDuty(s, 1)
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    await pickDuty(s, 2)
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    expect(dutyBg(dutyRowTds(wrapper, 1)[dayCol(8)])).toContain(DUTY_YELLOW) // 10-08 起是李四
+    expect(dutyBg(dutyRowTds(wrapper, 0)[dayCol(8)])).not.toContain(DUTY_YELLOW)
+  })
+
+  it('暂存：PUT 2026-10 带上跨月那一周，不被「不属于本月」拦掉', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await pickDuty(dutySelects(wrapper)[0], 1)
+    const before = getSchedule.mock.calls.length
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft).toHaveBeenCalledTimes(1)
+    const [ym, body] = saveDraft.mock.calls[0]
+    expect(ym).toBe('2026-10')
+    expect(body.entries).toEqual([])
+    expect(body.dutyPhones).toEqual([{ weekStart: '2026-09-28', staffId: 1 }])
+    // 跨月那一周的周一在上个月，不能走 M4-14 那句「不属于本月」的兜底
+    expect(ElMessage.warning).not.toHaveBeenCalled()
+    expect(btnByText('暂存（0）')).toBeTruthy()
+    expect(getSchedule).toHaveBeenCalledTimes(before + 1) // 暂存成功后刷新本月
+  })
+
+  it('清空已有的一周：送 staffId=null，标亮立即消失', async () => {
+    const { wrapper } = await mountDuty({
+      ym: '2026-10',
+      months: {
+        '2026-10': dutyMonthOf('2026-10', { dutyPhones: [dutyRow('2026-09-28', '2026-10-04', 1, '张三')] })
+      }
+    })
+    const s = dutySelects(wrapper)[0]
+    expect(s.props('modelValue')).toBe(1) // 打开时选择器就是该人
+    expect(dutyBg(dutyRowTds(wrapper, 0)[0])).toContain(DUTY_YELLOW)
+    await pickDuty(s, '') // clearable 清空传的是 ''
+    expect(s.props('modelValue')).toBeNull()
+    expect(dutyBg(dutyRowTds(wrapper, 0)[0])).not.toContain(DUTY_YELLOW)
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][1].dutyPhones).toEqual([{ weekStart: '2026-09-28', staffId: null }])
+  })
+
+  it('底色取 data.dutyPhoneColor：改成橙色后标亮为橙色，图例末尾有色块', async () => {
+    const { wrapper } = await mountDuty({
+      ym: '2026-10',
+      months: {
+        '2026-10': dutyMonthOf('2026-10', {
+          dutyPhones: [dutyRow('2026-09-28', '2026-10-04', 1, '张三')],
+          color: '#f97316'
+        })
+      }
+    })
+    expect(dutyBg(dutyRowTds(wrapper, 0)[dayCol(3)])).toContain(DUTY_ORANGE)
+    expect(dutyBg(dutyRowTds(wrapper, 0)[dayCol(3)])).not.toContain(DUTY_YELLOW)
+    const legend = wrapper.find('.legend .duty-legend .swatch')
+    expect(legend.exists()).toBe(true)
+    expect(legend.attributes('style')).toContain(DUTY_ORANGE)
+    expect(wrapper.find('.legend .duty-legend').text()).toContain('值班电话')
+  })
+
+  it('跨月那一周在 9 月同样显示：选择器是张三，9-28~9-30 黄底', async () => {
+    const { wrapper } = await mountDuty({
+      ym: '2026-09',
+      months: {
+        '2026-09': dutyMonthOf('2026-09', { dutyPhones: [dutyRow('2026-09-28', '2026-10-04', 1, '张三')] })
+      }
+    })
+    // 9 月涉及从 8/31 起的 5 周，最后那周正是 9/28–10/4
+    expect(dutyWeekLabels(wrapper)).toEqual(['8/31–9/6', '9/7–9/13', '9/14–9/20', '9/21–9/27', '9/28–10/4'])
+    expect(dutySelects(wrapper)[4].props('modelValue')).toBe(1)
+    const zhang = dutyRowTds(wrapper, 0)
+    expect(dutyBg(zhang[dayCol(27)])).not.toContain(DUTY_YELLOW) // 9-27 属于 9/21 那一周
+    for (const d of [28, 29, 30]) expect(dutyBg(zhang[dayCol(d)])).toContain(DUTY_YELLOW)
+    expect(dutyBg(zhang[dayCol(5)])).not.toContain(DUTY_YELLOW) // 本月自己的那周没安排
+  })
+
+  it('格子与值班电话合并计数，放弃修改一起清空', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await click(dutyRowTds(wrapper, 0)[0]) // 改一格
+    await click(btnByText('确定'))
+    await pickDuty(dutySelects(wrapper)[2], 1) // 再选一周
+    expect(btnByText('暂存（2）')).toBeTruthy()
+    expect(wrapper.text()).toContain('有 2 处未暂存')
+    await click(btnByText('放弃修改'))
+    expect(btnByText('暂存（0）')).toBeTruthy()
+    expect(dutyBg(dutyRowTds(wrapper, 0)[dayCol(15)])).not.toContain(DUTY_YELLOW)
+    expect(pendingTds(wrapper)).toHaveLength(0)
+  })
+
+  it('只改了值班电话也能暂存，提示里带上周数', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await pickDuty(dutySelects(wrapper)[3], 2)
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft).toHaveBeenCalledTimes(1)
+    expect(saveDraft.mock.calls[0][1]).toEqual({ entries: [], dutyPhones: [{ weekStart: '2026-10-19', staffId: 2 }] })
+    expect(ElMessage.success.mock.calls[0][0]).toContain('值班电话 1 周')
+  })
+
+  it('有值班电话未暂存时点发布：只弹提示，不发请求', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await pickDuty(dutySelects(wrapper)[0], 1)
+    await click(btnByText('发布排班'))
+    expect(ElMessageBox.alert.mock.calls[0][0]).toBe('有 1 处修改未暂存，请先暂存或放弃修改')
+    expect(publishSchedule).not.toHaveBeenCalled()
+    expect(saveDraft).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('值班电话') // 选择仍留在页面上
+  })
+
+  it('选了值班电话未暂存时点 ›：确认切月后清空，计数为 0', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-09' })
+    await pickDuty(dutySelects(wrapper)[4], 1) // 9/28–10/4 = 张三
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    await click(btnByText('›'))
+    expect(ElMessageBox.confirm).toHaveBeenLastCalledWith(
+      '有 1 处修改未暂存，切换月份将放弃这些修改，是否继续？',
+      '切换月份',
+      expect.anything()
+    )
+    expect(wrapper.text()).toContain('2026年10月')
+    expect(btnByText('暂存（0）')).toBeTruthy()
+    for (const s of dutySelects(wrapper)) expect(s.props('modelValue')).toBeNull()
+    expect(dutyBg(dutyRowTds(wrapper, 0)[0])).not.toContain(DUTY_YELLOW)
+    expect(saveDraft).not.toHaveBeenCalled()
+  })
+
+  it('切月取消则不切月，刚选的值班电话留在页面上', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-09' })
+    await pickDuty(dutySelects(wrapper)[0], 2)
+    ElMessageBox.confirm.mockRejectedValueOnce('cancel')
+    await click(btnByText('›'))
+    expect(wrapper.text()).toContain('2026年9月')
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    expect(dutySelects(wrapper)[0].props('modelValue')).toBe(2)
+  })
+
+  it('竞态：切月请求在途时选择器禁用且不写待暂存，新月落地后暂存只带新月那一周', async () => {
+    const { wrapper, arm, release } = await mountDuty({ ym: '2026-09' })
+    arm('2026-10') // 10 月的 GET 吊住：标题已翻过去，屏幕上还是 9 月那张表
+    await click(btnByText('›'))
+    expect(wrapper.text()).toContain('2026年10月')
+    const s = dutySelects(wrapper)[0]
+    expect(s.props('disabled')).toBe(true) // 与格子同开同关
+    await pickDuty(s, 1)
+    expect(btnByText('暂存（0）')).toBeTruthy()
+    await release('2026-10')
+    expect(btnByText('暂存（0）')).toBeTruthy()
+    expect(saveDraft).not.toHaveBeenCalled()
+    // 新月里正常选一周：送出的仍是新月的表
+    await pickDuty(dutySelects(wrapper)[1], 1)
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][0]).toBe('2026-10')
+    expect(saveDraft.mock.calls[0][1].dutyPhones).toEqual([{ weekStart: '2026-10-05', staffId: 1 }])
+  })
+
+  it('成员登录：只显示文字没有选择器；没排到值班电话的周不显示', async () => {
+    const { wrapper } = await mountDuty({
+      admin: false,
+      ym: '2026-10',
+      months: {
+        '2026-10': dutyMonthOf('2026-10', {
+          dutyPhones: [dutyRow('2026-09-28', '2026-10-04', 1, '张三')],
+          draft: false,
+          status: 'PUBLISHED'
+        })
+      }
+    })
+    expect(wrapper.findAll('.duty .wk')).toHaveLength(1) // 只渲染排到人的那一周
+    expect(dutySelects(wrapper)).toHaveLength(0)
+    expect(wrapper.find('.duty').text()).toContain('9/28–10/4')
+    expect(wrapper.find('.duty').text()).toContain('张三')
+    expect(dutyBg(dutyRowTds(wrapper, 0)[0])).toContain(DUTY_YELLOW) // 成员同样看到黄底
+    expect(btnByText('暂存（0）')).toBeFalsy() // 成员没有暂存入口
+  })
+
+  it('成员登录：没有任何已发布安排时不显示值班电话一行', async () => {
+    const { wrapper } = await mountDuty({
+      admin: false,
+      ym: '2026-10',
+      months: { '2026-10': dutyMonthOf('2026-10', { draft: false, status: 'PUBLISHED' }) }
+    })
+    expect(wrapper.find('.duty').exists()).toBe(false)
+  })
+
+  it('整月重写在途时选择器禁用', async () => {
+    const { wrapper } = await mountDuty({
+      ym: '2026-10',
+      months: {
+        '2026-10': dutyMonthOf('2026-10', { dutyPhones: [dutyRow('2026-09-28', '2026-10-04', 1, '张三')] })
+      }
+    })
+    publishSchedule.mockImplementation(() => new Promise(() => {})) // 整月重写吊住不返回
+    await click(btnByText('发布排班'))
+    await flushPromises()
+    expect(wrapper.text()).toContain('值班电话')
+    expect(dutySelects(wrapper)[0].props('disabled')).toBe(true)
+  })
+})
