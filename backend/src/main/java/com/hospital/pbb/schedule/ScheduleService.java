@@ -1,6 +1,7 @@
 package com.hospital.pbb.schedule;
 
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.cycle.CycleTemplate;
 import com.hospital.pbb.cycle.CycleTemplateRepository;
 import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
@@ -51,8 +52,9 @@ public class ScheduleService {
     private final ScheduleQueryService query;
     private final OpLogService opLog;
     private final Clock clock;
-    /** 下面三个仓库从 M4-05（按模板生成）、M4-09/M4-13（值班电话暂存与发布）起使用，本单只注入不使用 */
+    /** 按周期模板生成用（M4-05） */
     private final CycleTemplateRepository templateRepo;
+    /** 下面两个仓库从 M4-09/M4-13（值班电话暂存与发布）起使用，本单只注入不使用 */
     private final DutyPhoneWeekRepository dutyRepo;
     private final DutyPhonePublishedRepository dutyPublishedRepo;
 
@@ -82,14 +84,24 @@ public class ScheduleService {
      * <p>已手工改过的格子跳过不覆盖，其余格子一律重写成规则默认值；
      * 已经不存在于可排班名单里的人员的历史草稿不在本次范围内，保持不变。</p>
      *
+     * <p>默认值取自选定的周期模板（周一..周日各上什么班），节假日仍然压过模板；
+     * 本次用的模板 id 记到 {@code schedule_month.cycle_template_id} 上，单格“恢复规则默认”
+     * 据此重算，否则科长按模板排好的班会被内置规则的周六日默认值冲掉（设计 §8.5）。</p>
+     *
      * @param yearMonth  {@code YYYY-MM}，格式不对由 {@link ScheduleMonths#parse} 抛 code=1500
+     * @param templateId 周期模板 id；null 表示用默认模板，没有默认模板时用内置规则
      * @param operatorId 操作人（科长）id，写入格子的 {@code updated_by}
      * @return 写入格数与跳过的手工格数
+     * @throws BizException code=1507 模板不存在；1502 模板中的班次不存在或已停用
      */
     @Transactional
-    public GenerateResultVO generate(String yearMonth, Long operatorId) {
+    public GenerateResultVO generate(String yearMonth, Long templateId, Long operatorId) {
         YearMonth ym = ScheduleMonths.parse(yearMonth);
         monthRepo.lockMonth(ScheduleMonths.lockKey(ym));
+
+        // 模板在取锁之后、写第一格之前解析完：模板有问题时整月一格都不写
+        CycleTemplate template = resolveTemplate(templateId);
+        List<String> days = template == null ? null : template.days();
 
         LocalDate start = ym.atDay(1);
         LocalDate end = ym.atEndOfMonth();
@@ -109,7 +121,7 @@ public class ScheduleService {
                 if (entry == null) {
                     entry = newEntry(staff.getId(), date);
                 }
-                entry.setShiftCode(calendar.defaultShift(date));
+                entry.setShiftCode(calendar.defaultShift(date, days));
                 entry.setManual(false);
                 entry.setUpdatedBy(operatorId);
                 entry.setUpdatedAt(now);
@@ -118,10 +130,47 @@ public class ScheduleService {
             }
         }
 
-        markDraft(yearMonth);
+        ScheduleMonth month = markDraft(yearMonth);
+        month.setCycleTemplateId(template == null ? null : template.getId());
+        monthRepo.save(month);
         opLog.record(OpAction.GENERATE_SCHEDULE, yearMonth,
-                "生成" + generated + "格，跳过手工" + skippedManual + "格");
+                (template == null ? "内置规则" : "模板【" + template.getName() + "】")
+                        + "，生成" + generated + "格，跳过手工" + skippedManual + "格");
         return new GenerateResultVO(generated, skippedManual);
+    }
+
+    /**
+     * 取本次生成要用的模板：指定 id 时它必须存在；未指定时退回默认模板，
+     * 一个默认模板也没有时返回 null（= 按内置规则生成）。
+     *
+     * @throws BizException code=1507 指定的模板不存在
+     */
+    private CycleTemplate resolveTemplate(Long templateId) {
+        CycleTemplate template;
+        if (templateId != null) {
+            template = templateRepo.findById(templateId)
+                    .orElseThrow(() -> new BizException(1507, "排班周期模板不存在"));
+        } else {
+            // 没指定模板就用默认模板；一个默认模板也没有 → null，退回内置规则
+            template = templateRepo.findFirstByDefaultTemplateTrue().orElse(null);
+        }
+        if (template != null) {
+            validateTemplateShifts(template);
+        }
+        return template;
+    }
+
+    /**
+     * 模板里某一天排的班必须是启用中的班次，否则整月不生成：按一个半废的模板铺完全月，
+     * 等于把已停用的班种塞进排班表。
+     *
+     * @throws BizException code=1502 模板中的班次不存在或已停用
+     */
+    private void validateTemplateShifts(CycleTemplate template) {
+        for (String code : template.days().stream().distinct().toList()) {
+            shiftRepo.findById(code).filter(ShiftType::isEnabled)
+                    .orElseThrow(() -> new BizException(1502, "模板中的班次不存在或已停用"));
+        }
     }
 
     /**
@@ -151,8 +200,8 @@ public class ScheduleService {
         String shiftCode;
         boolean manual;
         if (req.shiftCode() == null) {
-            // 恢复默认不算手工修改：重算规则值，并且摘掉 manual 标记，下次生成可以正常覆盖
-            shiftCode = calendar.defaultShift(workDate);
+            // 恢复默认不算手工修改：按该月记录的模板重算默认值，并且摘掉 manual 标记，下次生成可以正常覆盖
+            shiftCode = calendar.defaultShift(workDate, templateDaysOf(yearMonth));
             manual = false;
         } else {
             ShiftType shift = shiftRepo.findById(req.shiftCode())
@@ -291,12 +340,15 @@ public class ScheduleService {
     }
 
     /**
-     * 把当月状态打回草稿。
+     * 把当月状态打回草稿，并返回这个月对象供调用方继续改其余字段（生成要顺带记模板 id）。
      *
      * <p>从没碰过的月份在 {@code schedule_month} 里没有记录，先按初始值补一条再置状态，
      * version 和 publishedAt 都不动——那是发布（M2-05）维护的字段。</p>
+     *
+     * <p>返回的是这里构造或查到的对象本身，不是 {@code save} 的返回值：调用方还要在它上面继续赋值，
+     * 而打桩测试里的 {@code save} 可能返回 null。</p>
      */
-    private void markDraft(String yearMonth) {
+    private ScheduleMonth markDraft(String yearMonth) {
         ScheduleMonth month = monthRepo.findById(yearMonth).orElseGet(() -> {
             ScheduleMonth created = new ScheduleMonth();
             created.setYearMonth(yearMonth);
@@ -306,6 +358,19 @@ public class ScheduleService {
         });
         month.setStatus(ScheduleStatus.DRAFT);
         monthRepo.save(month);
+        return month;
+    }
+
+    /**
+     * 该月记录的模板的 7 天班次；月份无记录、未记录模板或模板已删除时返回 null（= 退回内置规则）。
+     * 生成之后模板可能被删除，这里只负责取值，取值失败就退回内置规则，不再报错。
+     */
+    private List<String> templateDaysOf(String yearMonth) {
+        Long templateId = monthRepo.findById(yearMonth).map(ScheduleMonth::getCycleTemplateId).orElse(null);
+        if (templateId == null) {
+            return null;
+        }
+        return templateRepo.findById(templateId).map(CycleTemplate::days).orElse(null);
     }
 
     /** 生成只铺"启用中且参与排班"的人员，顺序沿用月视图的人员排序 */

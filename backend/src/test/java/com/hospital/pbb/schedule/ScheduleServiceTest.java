@@ -1,6 +1,7 @@
 package com.hospital.pbb.schedule;
 
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.cycle.CycleTemplate;
 import com.hospital.pbb.cycle.CycleTemplateRepository;
 import com.hospital.pbb.holiday.Holiday;
 import com.hospital.pbb.holiday.HolidayType;
@@ -165,6 +166,21 @@ class ScheduleServiceTest {
         return holiday;
     }
 
+    /** 周一..周日的周期模板；days 必须恰好 7 个 */
+    private static CycleTemplate template(long id, String name, boolean asDefault, String... days) {
+        CycleTemplate template = new CycleTemplate();
+        template.setId(id);
+        template.setName(name);
+        template.setDays(List.of(days));
+        template.setDefaultTemplate(asDefault);
+        return template;
+    }
+
+    /** 全白班模板：周一..周日全排 N */
+    private static CycleTemplate allN(long id, String name) {
+        return template(id, name, false, "N", "N", "N", "N", "N", "N", "N");
+    }
+
     /** 生成是整月写入，save 会被调用很多次，统一按 "人员|日期" 收拢后再断言 */
     private Map<String, ScheduleEntry> savedEntries() {
         ArgumentCaptor<ScheduleEntry> captor = ArgumentCaptor.forClass(ScheduleEntry.class);
@@ -176,10 +192,12 @@ class ScheduleServiceTest {
         return saved;
     }
 
+    /** 生成会先打回草稿、再补记模板 id，save 不止一次；取最后一次，那是最终落库的那条 */
     private ScheduleMonth savedMonth() {
         ArgumentCaptor<ScheduleMonth> captor = ArgumentCaptor.forClass(ScheduleMonth.class);
-        verify(monthRepo).save(captor.capture());
-        return captor.getValue();
+        verify(monthRepo, atLeastOnce()).save(captor.capture());
+        List<ScheduleMonth> saved = captor.getAllValues();
+        return saved.get(saved.size() - 1);
     }
 
     /** 发布是整月重写快照，saveAll 应恰好被调用一次 */
@@ -194,7 +212,7 @@ class ScheduleServiceTest {
     /** 用例：整月无草稿、无节假日 → 31 格全按规则写入，工作日 D、周六 X，月份状态为 DRAFT */
     @Test
     void generateFillsWholeMonthWithRuleDefaults() {
-        GenerateResultVO result = service.generate(YM, OPERATOR);
+        GenerateResultVO result = service.generate(YM, null, OPERATOR);
 
         assertEquals(new GenerateResultVO(31, 0), result);
         Map<String, ScheduleEntry> saved = savedEntries();
@@ -213,7 +231,7 @@ class ScheduleServiceTest {
         ScheduleEntry manual = draft(1L, D5, "N", true);
         when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(List.of(manual));
 
-        GenerateResultVO result = service.generate(YM, OPERATOR);
+        GenerateResultVO result = service.generate(YM, null, OPERATOR);
 
         assertEquals(new GenerateResultVO(30, 1), result);
         // 跳过的格子既不重写也不保存，其余 30 格照写
@@ -231,7 +249,7 @@ class ScheduleServiceTest {
         when(entryRepo.findByWorkDateBetween(START, END))
                 .thenReturn(List.of(draft(1L, D5, "N", false)));
 
-        service.generate(YM, OPERATOR);
+        service.generate(YM, null, OPERATOR);
 
         ScheduleEntry entry = savedEntries().get("1|" + D5);
         assertEquals("D", entry.getShiftCode());
@@ -243,7 +261,7 @@ class ScheduleServiceTest {
     void generateResetsPublishedMonthToDraft() {
         when(monthRepo.findById(YM)).thenReturn(Optional.of(month(ScheduleStatus.PUBLISHED, 3)));
 
-        service.generate(YM, OPERATOR);
+        service.generate(YM, null, OPERATOR);
 
         ScheduleMonth saved = savedMonth();
         assertEquals(ScheduleStatus.DRAFT, saved.getStatus());
@@ -256,7 +274,7 @@ class ScheduleServiceTest {
         when(query.calendar(START, END)).thenAnswer(inv ->
                 new RuleCalendar(List.of(holiday("国庆节", "2026-10-01", "2026-10-07", HolidayType.HOLIDAY))));
 
-        service.generate(YM, OPERATOR);
+        service.generate(YM, null, OPERATOR);
 
         Map<String, ScheduleEntry> saved = savedEntries();
         assertEquals("X", saved.get("1|" + START).getShiftCode());       // 10-01 周四但放假
@@ -269,29 +287,131 @@ class ScheduleServiceTest {
         when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc())
                 .thenReturn(List.of(staff(1L, true, true), staff(2L, false, true)));
 
-        GenerateResultVO result = service.generate(YM, OPERATOR);
+        GenerateResultVO result = service.generate(YM, null, OPERATOR);
 
         assertEquals(new GenerateResultVO(31, 0), result);
         assertEquals(31, savedEntries().size());
     }
 
-    /** 生成留痕：target 是月份，detail 是写入与跳过格数 */
+    /** 生成留痕：target 是月份，detail 是“内置规则/模板【名称】，写入与跳过格数”（未指定模板且无默认模板时为内置规则） */
     @Test
     void generateRecordsOpLog() {
-        service.generate(YM, OPERATOR);
+        service.generate(YM, null, OPERATOR);
 
-        verify(opLog).record(OpAction.GENERATE_SCHEDULE, YM, "生成31格，跳过手工0格");
+        verify(opLog).record(OpAction.GENERATE_SCHEDULE, YM, "内置规则，生成31格，跳过手工0格");
     }
 
     /** 用例：写之前必须先取当月 advisory lock，锁在 lockMonth(202610) 之后才允许落库 */
     @Test
     void generateTakesMonthLockBeforeSaving() {
-        service.generate(YM, OPERATOR);
+        service.generate(YM, null, OPERATOR);
 
         InOrder order = inOrder(monthRepo, entryRepo);
         order.verify(monthRepo).lockMonth(LOCK_KEY);
         // 整月写入，save 不止一次，只验它在锁之后
         order.verify(entryRepo, atLeastOnce()).save(any(ScheduleEntry.class));
+    }
+
+    // ---------- generate：按周期模板（任务单 M4-05）----------
+
+    /** 用例：templateId=null 且有默认模板 [D,D,D,D,D,X,X] → 10-05 D、10-10 X，月份记下默认模板 id */
+    @Test
+    void generateUsesDefaultTemplateAndRecordsItsId() {
+        when(templateRepo.findFirstByDefaultTemplateTrue())
+                .thenReturn(Optional.of(template(1L, "做五休二", true, "D", "D", "D", "D", "D", "X", "X")));
+
+        service.generate(YM, null, OPERATOR);
+
+        Map<String, ScheduleEntry> saved = savedEntries();
+        assertEquals("D", saved.get("1|" + D5).getShiftCode());    // 10-05 周一
+        assertEquals("X", saved.get("1|" + D10).getShiftCode());   // 10-10 周六
+        assertEquals(1L, savedMonth().getCycleTemplateId());
+        assertEquals(ScheduleStatus.DRAFT, savedMonth().getStatus());
+        verify(opLog).record(OpAction.GENERATE_SCHEDULE, YM, "模板【做五休二】，生成31格，跳过手工0格");
+    }
+
+    /** 用例：指定模板 2（全 N）→ 非节假日全为 N（含周六），节假日仍是 X，记下 cycleTemplateId=2 */
+    @Test
+    void generateUsesTemplateByIdAndKeepsHolidaysOff() {
+        when(query.calendar(START, END)).thenAnswer(inv ->
+                new RuleCalendar(List.of(holiday("国庆节", "2026-10-01", "2026-10-07", HolidayType.HOLIDAY))));
+        when(templateRepo.findById(2L)).thenReturn(Optional.of(allN(2L, "全白班")));
+
+        service.generate(YM, 2L, OPERATOR);
+
+        Map<String, ScheduleEntry> saved = savedEntries();
+        assertEquals(31, saved.size());
+        assertEquals("N", saved.get("1|" + LocalDate.of(2026, 10, 8)).getShiftCode());  // 假期后的周四
+        assertEquals("N", saved.get("1|" + D10).getShiftCode());   // 周六也排 N
+        for (LocalDate date = START; !date.isAfter(LocalDate.of(2026, 10, 7)); date = date.plusDays(1)) {
+            assertEquals("X", saved.get("1|" + date).getShiftCode(), date.toString());   // 国庆 7 天照旧休
+        }
+        assertEquals(2L, savedMonth().getCycleTemplateId());
+        // 指定了模板就不再看默认模板
+        verify(templateRepo, never()).findFirstByDefaultTemplateTrue();
+    }
+
+    /** 用例：指定的模板不存在 → 1507，一格也不写 */
+    @Test
+    void generateRejectsUnknownTemplateAndWritesNothing() {
+        when(templateRepo.findById(99L)).thenReturn(Optional.empty());
+
+        BizException e = assertThrows(BizException.class, () -> service.generate(YM, 99L, OPERATOR));
+
+        assertEquals(1507, e.getCode());
+        verify(entryRepo, never()).save(any(ScheduleEntry.class));
+        verify(monthRepo, never()).save(any(ScheduleMonth.class));
+        verify(opLog, never()).record(anyString(), anyString(), anyString());
+    }
+
+    /** 用例：模板里有已停用 / 不存在的班次 → 1502，整月不生成 */
+    @Test
+    void generateRejectsTemplateWithDisabledOrUnknownShift() {
+        when(templateRepo.findById(2L)).thenReturn(Optional.of(
+                template(2L, "含停用班", false, "D", "D", "D", "D", "D", "D", "B")));
+        when(shiftRepo.findById("B")).thenReturn(Optional.of(shift("B", false)));
+
+        BizException e = assertThrows(BizException.class, () -> service.generate(YM, 2L, OPERATOR));
+        assertEquals(1502, e.getCode());
+
+        when(templateRepo.findById(3L)).thenReturn(Optional.of(
+                template(3L, "含不存在班", false, "D", "Q", "D", "D", "D", "D", "D")));
+        when(shiftRepo.findById("Q")).thenReturn(Optional.empty());
+        assertEquals(1502, assertThrows(BizException.class,
+                () -> service.generate(YM, 3L, OPERATOR)).getCode());
+
+        verify(entryRepo, never()).save(any(ScheduleEntry.class));
+        verify(monthRepo, never()).save(any(ScheduleMonth.class));
+    }
+
+    /** 用例：没有默认模板且 templateId=null → 按内置规则生成，cycleTemplateId 置 null（连上次记的一并清掉） */
+    @Test
+    void generateWithoutAnyTemplateFallsBackToBuiltinRule() {
+        ScheduleMonth recorded = month(ScheduleStatus.PUBLISHED, 1);
+        recorded.setCycleTemplateId(2L);
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(recorded));
+        when(templateRepo.findFirstByDefaultTemplateTrue()).thenReturn(Optional.empty());
+
+        service.generate(YM, null, OPERATOR);
+
+        Map<String, ScheduleEntry> saved = savedEntries();
+        assertEquals("D", saved.get("1|" + D5).getShiftCode());
+        assertEquals("X", saved.get("1|" + D10).getShiftCode());
+        assertNull(savedMonth().getCycleTemplateId());
+        verify(templateRepo, never()).findById(any());
+    }
+
+    /** 用例：模板只影响非手工格——手工改过的 N 格照样跳过，不会被模板值冲掉 */
+    @Test
+    void generateWithTemplateStillKeepsManualCells() {
+        when(templateRepo.findFirstByDefaultTemplateTrue())
+                .thenReturn(Optional.of(template(1L, "做五休二", true, "D", "D", "D", "D", "D", "X", "X")));
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(List.of(draft(1L, D10, "Z", true)));
+
+        GenerateResultVO result = service.generate(YM, null, OPERATOR);
+
+        assertEquals(new GenerateResultVO(30, 1), result);
+        assertFalse(savedEntries().containsKey("1|" + D10));
     }
 
     // ---------- updateEntry ----------
@@ -379,6 +499,35 @@ class ScheduleServiceTest {
         assertEquals(0, saved.getVersion());
     }
 
+    /** 该月记的是全 N 模板 → 10-05 恢复默认得到模板值 N（不是内置规则的 D），manual=false */
+    @Test
+    void updateEntryWithNullCodeRestoresMonthTemplateDefault() {
+        ScheduleMonth recorded = month(ScheduleStatus.DRAFT, 1);
+        recorded.setCycleTemplateId(2L);
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(recorded));
+        when(templateRepo.findById(2L)).thenReturn(Optional.of(allN(2L, "全白班")));
+        when(entryRepo.findByStaffIdAndWorkDate(1L, D5))
+                .thenReturn(Optional.of(draft(1L, D5, "D", true)));
+
+        CellVO cell = service.updateEntry(YM, new UpdateEntryRequest(1L, D5, null, null), OPERATOR);
+
+        assertEquals(new CellVO("N", false, null), cell);
+        verify(opLog).record(OpAction.UPDATE_SCHEDULE, "人员1 10-05", "D → N");
+    }
+
+    /** 该月记的模板后来被删了 → 退回内置规则（10-05 周一 = D），不报错 */
+    @Test
+    void updateEntryWithNullCodeFallsBackWhenMonthTemplateGone() {
+        ScheduleMonth recorded = month(ScheduleStatus.DRAFT, 1);
+        recorded.setCycleTemplateId(9L);
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(recorded));
+        when(templateRepo.findById(9L)).thenReturn(Optional.empty());
+
+        CellVO cell = service.updateEntry(YM, new UpdateEntryRequest(1L, D5, null, null), OPERATOR);
+
+        assertEquals(new CellVO("D", false, null), cell);
+    }
+
     /** 用例：日期跨到 11 月 → 1503，且一行都不写 */
     @Test
     void updateEntryRejectsDateOutsideMonth() {
@@ -460,7 +609,7 @@ class ScheduleServiceTest {
     /** 生成、改格子都只动草稿表，已发布快照一律不碰（发布是 M2-05） */
     @Test
     void writeMethodsNeverTouchPublishedSnapshot() {
-        service.generate(YM, OPERATOR);
+        service.generate(YM, null, OPERATOR);
         service.updateEntry(YM, new UpdateEntryRequest(1L, D5, "N", null), OPERATOR);
 
         verify(publishedRepo, never()).save(any());
