@@ -1,6 +1,7 @@
 package com.hospital.pbb.schedule;
 
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.cycle.CycleTemplateRepository;
 import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.dto.CellChange;
@@ -50,11 +51,17 @@ public class ScheduleService {
     private final ScheduleQueryService query;
     private final OpLogService opLog;
     private final Clock clock;
+    /** 下面三个仓库从 M4-05（按模板生成）、M4-09/M4-13（值班电话暂存与发布）起使用，本单只注入不使用 */
+    private final CycleTemplateRepository templateRepo;
+    private final DutyPhoneWeekRepository dutyRepo;
+    private final DutyPhonePublishedRepository dutyPublishedRepo;
 
     public ScheduleService(ScheduleMonthRepository monthRepo, ScheduleEntryRepository entryRepo,
                            SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
                            ShiftTypeRepository shiftRepo, ScheduleQueryService query,
-                           OpLogService opLog, Clock clock) {
+                           OpLogService opLog, Clock clock,
+                           CycleTemplateRepository templateRepo, DutyPhoneWeekRepository dutyRepo,
+                           DutyPhonePublishedRepository dutyPublishedRepo) {
         this.monthRepo = monthRepo;
         this.entryRepo = entryRepo;
         // 快照表由 M2-05 的发布写入，这里注入是为了锁与读写口径一致，本单不碰快照
@@ -64,6 +71,9 @@ public class ScheduleService {
         this.query = query;
         this.opLog = opLog;
         this.clock = clock;
+        this.templateRepo = templateRepo;
+        this.dutyRepo = dutyRepo;
+        this.dutyPublishedRepo = dutyPublishedRepo;
     }
 
     /**

@@ -1,6 +1,7 @@
 package com.hospital.pbb.schedule;
 
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.cycle.CycleTemplateRepository;
 import com.hospital.pbb.holiday.Holiday;
 import com.hospital.pbb.holiday.HolidayType;
 import com.hospital.pbb.oplog.OpAction;
@@ -73,6 +74,9 @@ class ScheduleServiceTest {
     private ShiftTypeRepository shiftRepo;
     private ScheduleQueryService query;
     private OpLogService opLog;
+    private CycleTemplateRepository templateRepo;
+    private DutyPhoneWeekRepository dutyRepo;
+    private DutyPhonePublishedRepository dutyPublishedRepo;
     private ScheduleService service;
 
     @BeforeEach
@@ -84,8 +88,12 @@ class ScheduleServiceTest {
         shiftRepo = mock(ShiftTypeRepository.class);
         query = mock(ScheduleQueryService.class);
         opLog = mock(OpLogService.class);
+        templateRepo = mock(CycleTemplateRepository.class);
+        dutyRepo = mock(DutyPhoneWeekRepository.class);
+        dutyPublishedRepo = mock(DutyPhonePublishedRepository.class);
         service = new ScheduleService(monthRepo, entryRepo, publishedRepo, staffRepo, shiftRepo, query, opLog,
-                Clock.fixed(Instant.parse("2026-09-30T00:00:00Z"), ZoneId.of("Asia/Shanghai")));
+                Clock.fixed(Instant.parse("2026-09-30T00:00:00Z"), ZoneId.of("Asia/Shanghai")),
+                templateRepo, dutyRepo, dutyPublishedRepo);
 
         // 默认：1 名可排班人员、整月无节假日、库里没有任何草稿、schedule_month 里也没有这一月
         when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc()).thenReturn(List.of(staff(1L, true, true)));

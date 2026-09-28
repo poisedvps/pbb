@@ -3,6 +3,7 @@ package com.hospital.pbb.stats;
 import com.hospital.pbb.common.BizException;
 import com.hospital.pbb.holiday.Holiday;
 import com.hospital.pbb.holiday.HolidayType;
+import com.hospital.pbb.schedule.DutyPhonePublishedRepository;
 import com.hospital.pbb.schedule.RuleCalendar;
 import com.hospital.pbb.schedule.SchedulePublishedEntry;
 import com.hospital.pbb.schedule.SchedulePublishedEntryRepository;
@@ -47,6 +48,7 @@ class StatsServiceTest {
     private StaffRepository staffRepo;
     private ShiftTypeRepository shiftRepo;
     private ScheduleQueryService query;
+    private DutyPhonePublishedRepository dutyPublishedRepo;
     private StatsService service;
 
     @BeforeEach
@@ -55,7 +57,8 @@ class StatsServiceTest {
         staffRepo = mock(StaffRepository.class);
         shiftRepo = mock(ShiftTypeRepository.class);
         query = mock(ScheduleQueryService.class);
-        service = new StatsService(publishedRepo, staffRepo, shiftRepo, query);
+        dutyPublishedRepo = mock(DutyPhonePublishedRepository.class);
+        service = new StatsService(publishedRepo, staffRepo, shiftRepo, query, dutyPublishedRepo);
 
         // 默认：区间内没有节假日、没有快照，人员表里只有一个可排班的 A
         when(query.calendar(any(), any())).thenReturn(new RuleCalendar(List.of()));
