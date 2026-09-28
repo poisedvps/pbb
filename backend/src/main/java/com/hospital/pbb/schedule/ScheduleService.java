@@ -391,6 +391,10 @@ public class ScheduleService {
      * <p>同样先取当月 advisory lock：不锁的话两个科长同时发布，删除与插入会交叉执行，
      * 快照里会混进两个版本的数据。</p>
      *
+     * <p>值班电话一并发布：把该月涉及各周的草稿整体复制成已发布快照，成员和大屏从此看得到
+     * （设计 §8.5“发布”）。该月第一周的周一常常落在上个月，这一周的草稿是上个月和本月共用的，
+     * 所以先按月份升序取上个月的锁再取本月的锁，否则会与上个月正在进行的发布同时写同一周。</p>
+     *
      * @param yearMonth  {@code YYYY-MM}，格式不对由 {@link ScheduleMonths#parse} 抛 code=1500
      * @param operatorId 操作人（科长）id，写入 {@code schedule_month.published_by}
      * @return 本次发布的版本号与复制格数
@@ -399,6 +403,12 @@ public class ScheduleService {
     @Transactional
     public PublishResultVO publish(String yearMonth, Long operatorId) {
         YearMonth ym = ScheduleMonths.parse(yearMonth);
+        // 该月第一周的周一可能落在上个月（如 2026-10 → 09-28），值班电话按周存，这一周两个月共用
+        LocalDate firstWeekStart = ScheduleMonths.firstWeekStart(ym);
+        YearMonth firstMonth = YearMonth.from(firstWeekStart);
+        if (firstMonth.isBefore(ym)) {
+            monthRepo.lockMonth(ScheduleMonths.lockKey(firstMonth));
+        }
         monthRepo.lockMonth(ScheduleMonths.lockKey(ym));
 
         LocalDate start = ym.atDay(1);
@@ -420,6 +430,14 @@ public class ScheduleService {
         publishedRepo.deleteByWorkDateRange(start, end);
         publishedRepo.saveAll(entries.stream().map(entry -> newSnapshot(entry, newVersion)).toList());
 
+        // 值班电话同样整段重写：范围从第一周的周一起，跨月那一周以本次发布为准（设计 §8.5）
+        dutyPublishedRepo.deleteByWeekStartRange(firstWeekStart, end);
+        List<DutyPhonePublished> dutySnapshots =
+                dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(firstWeekStart, end).stream()
+                        .map(ScheduleService::newDutySnapshot)
+                        .toList();
+        dutyPublishedRepo.saveAll(dutySnapshots);
+
         month.setVersion(newVersion);
         month.setStatus(ScheduleStatus.PUBLISHED);
         month.setPublishedAt(OffsetDateTime.now(clock));
@@ -427,8 +445,16 @@ public class ScheduleService {
         monthRepo.save(month);
 
         opLog.record(OpAction.PUBLISH_SCHEDULE, yearMonth,
-                "版本 v" + newVersion + "，共" + entries.size() + "格");
+                "版本 v" + newVersion + "，共" + entries.size() + "格，值班电话" + dutySnapshots.size() + "周");
         return new PublishResultVO(newVersion, entries.size());
+    }
+
+    /** 值班电话快照只带走周一与人员：草稿上的 updated_by / updated_at 是编辑痕迹，不进快照表 */
+    private static DutyPhonePublished newDutySnapshot(DutyPhoneWeek week) {
+        DutyPhonePublished snapshot = new DutyPhonePublished();
+        snapshot.setWeekStart(week.getWeekStart());
+        snapshot.setStaffId(week.getStaffId());
+        return snapshot;
     }
 
     /**
