@@ -38,6 +38,19 @@
         </template>
       </el-table-column>
     </el-table>
+
+    <!-- 值班电话底色是整格背景，与上面的班次色块不是一回事，全系统只有这一处可改 -->
+    <div class="duty-color">
+      <b class="dc-title">值班电话底色</b>
+      <p class="note">排班表与大屏中，值班电话负责人当周 7 天的格子使用此底色。</p>
+      <div class="dc-row">
+        <el-color-picker v-model="dutyColor" :predefine="DUTY_COLOR_PRESETS" />
+        <div class="dc-cell" :style="{ background: dutyColor || '#ffffff' }">
+          <span class="code-chip" :style="{ background: dayShiftColor }">白班</span>
+        </div>
+        <el-button type="primary" :loading="savingColor" :disabled="!dutyColor" @click="saveDutyColor">保存</el-button>
+      </div>
+    </div>
   </el-card>
 
   <!-- 班次只有修改，没有新增：code 与排序不开放编辑 -->
@@ -82,9 +95,13 @@
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { listShiftTypes, updateShiftType } from '../api/shifts'
+import { getDutyPhoneColor, updateDutyPhoneColor } from '../api/settings'
 
 // 白班、休息是规则排班的兜底班次，后端 1301 会拒绝停用，前端直接锁死开关
 const REQUIRED_CODES = ['D', 'X']
+
+// 值班电话底色的候选项，第一个是系统默认值
+const DUTY_COLOR_PRESETS = ['#fde047', '#fdba74', '#86efac', '#93c5fd']
 
 const list = ref([])
 const loading = ref(false)
@@ -111,6 +128,36 @@ const reload = async () => {
   }
 }
 onMounted(reload)
+
+// 白班色块只是示意底色压在班次色块下面的效果，取不到白班就退回内置蓝
+const dayShiftColor = computed(() => list.value.find((s) => s.code === 'D')?.color || '#1d4ed8')
+const dutyColor = ref('')
+const savingColor = ref(false)
+
+const reloadDutyColor = async () => {
+  try {
+    const { color } = await getDutyPhoneColor()
+    dutyColor.value = color || ''
+  } catch {
+    // 失败提示由 http 拦截器统一弹出
+  }
+}
+onMounted(reloadDutyColor)
+
+const saveDutyColor = async () => {
+  if (savingColor.value || !dutyColor.value) return
+  savingColor.value = true
+  try {
+    // 后端统一转小写，回填一次让预览格与库里的值一致
+    const saved = await updateDutyPhoneColor(dutyColor.value)
+    if (saved?.color) dutyColor.value = saved.color
+    ElMessage.success('已保存')
+  } catch {
+    // 失败提示由 http 拦截器统一弹出（如 1304 颜色格式）
+  } finally {
+    savingColor.value = false
+  }
+}
 
 const dialogVisible = ref(false)
 const saving = ref(false)
@@ -190,6 +237,21 @@ const submit = async () => {
 
 <style scoped>
 .note { margin: 0 0 12px; font-size: 12px; color: #6b7280; }
+/* 预览格对齐排班表单元格的尺寸（min-width 46px / height 38px） */
+.dc-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 46px;
+  height: 38px;
+  border: 1px solid #e3e7ee;
+  border-radius: 4px;
+}
+.duty-color { margin-top: 18px; }
+.dc-title { display: block; margin-bottom: 4px; }
+.duty-color .note { margin: 0 0 10px; }
+.dc-row { display: flex; align-items: center; gap: 12px; }
 /* 色块用班次自己的背景色，文字为 code，与排班表格里填充色一致 */
 .code-chip {
   display: inline-block;
