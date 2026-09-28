@@ -1,6 +1,7 @@
 package com.hospital.pbb.stats;
 
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.schedule.DutyPhonePublished;
 import com.hospital.pbb.schedule.DutyPhonePublishedRepository;
 import com.hospital.pbb.schedule.RuleCalendar;
 import com.hospital.pbb.schedule.SchedulePublishedEntry;
@@ -28,7 +29,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * 统计报表（设计 §5.4，任务单 M3-06）。
+ * 统计报表（设计 §5.4、§8.5，任务单 M3-06、M4-07）。
  *
  * <p>只统计已发布快照 {@code schedule_published_entry}——草稿是科长没定下来的东西，
  * 进了报表就会和成员看到的对不上。节假日/周末的判断复用
@@ -44,7 +45,7 @@ public class StatsService {
     private final StaffRepository staffRepo;
     private final ShiftTypeRepository shiftRepo;
     private final ScheduleQueryService query;
-    /** M4-07 统计值班电话天数起使用，本单只注入不使用 */
+    /** 值班电话已发布快照（设计 §8.3），统计只读 */
     private final DutyPhonePublishedRepository dutyPublishedRepo;
 
     public StatsService(SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
@@ -80,6 +81,7 @@ public class StatsService {
         Map<String, ShiftType> shifts = shiftByCode();
         RuleCalendar calendar = query.calendar(from, to);
         Map<Long, List<SchedulePublishedEntry>> entriesByStaff = entriesByStaff(from, to);
+        Map<Long, Integer> dutyPhoneDays = dutyPhoneDays(from, to);
 
         List<StatsRowVO> rows = new ArrayList<>();
         for (Staff staff : staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc()) {
@@ -87,13 +89,15 @@ public class StatsService {
                 continue;
             }
             rows.add(rowOf(staff, shifts, calendar,
-                    entriesByStaff.getOrDefault(staff.getId(), List.of())));
+                    entriesByStaff.getOrDefault(staff.getId(), List.of()),
+                    dutyPhoneDays.getOrDefault(staff.getId(), 0)));
         }
         return new StatsVO(from, to, rows);
     }
 
     /**
-     * 导出表头（任务单 M3-08）：工号、姓名、各班次名称（顺序同班次 sort_order）、节假日/周末上班、总工时。
+     * 导出表头（任务单 M3-08、M4-07）：工号、姓名、各班次名称（顺序同班次 sort_order）、
+     * 节假日/周末上班、值班电话（天）、总工时。
      *
      * <p>列顺序以 {@code shift_type} 为准，不是以某一行的 counts 为准：表头要永远和统计页的列
      * 一一对应，不能因为某个人一个班没排就少一列。</p>
@@ -101,20 +105,21 @@ public class StatsService {
     @Transactional(readOnly = true)
     public List<String> exportHeaders() {
         List<ShiftType> shifts = shiftRepo.findAllByOrderBySortOrderAsc();
-        List<String> headers = new ArrayList<>(shifts.size() + 4);
+        List<String> headers = new ArrayList<>(shifts.size() + 5);
         headers.add("工号");
         headers.add("姓名");
         for (ShiftType shift : shifts) {
             headers.add(shift.getName());
         }
         headers.add("节假日/周末上班");
+        headers.add("值班电话（天）");
         headers.add("总工时");
         return headers;
     }
 
     /**
      * 把 {@link #stats} 的结果摊平成导出用的行，列顺序与 {@link #exportHeaders()} 完全一致；
-     * 各班次天数、节假日/周末上班是 {@code Integer}，总工时是 {@code BigDecimal}，
+     * 各班次天数、节假日/周末上班、值班电话（天）是 {@code Integer}，总工时是 {@code BigDecimal}，
      * 交给 {@link com.hospital.pbb.common.ExcelWriter} 后都是能求和的数值格。
      *
      * <p>counts 里查不到对应班次的残留代号（{@code shift_type} 已删）在这里被丢掉——
@@ -125,13 +130,14 @@ public class StatsService {
         List<String> codes = shiftCodes();
         List<List<Object>> rows = new ArrayList<>(vo.rows().size());
         for (StatsRowVO row : vo.rows()) {
-            List<Object> cells = new ArrayList<>(codes.size() + 4);
+            List<Object> cells = new ArrayList<>(codes.size() + 5);
             cells.add(row.empNo());
             cells.add(row.name());
             for (String code : codes) {
                 cells.add(row.counts().get(code));
             }
             cells.add(row.offDayWork());
+            cells.add(row.dutyPhoneDays());
             cells.add(row.totalHours());
             rows.add(cells);
         }
@@ -146,9 +152,9 @@ public class StatsService {
         return Objects.equals(me.staffId(), staff.getId());
     }
 
-    /** 一行 = 全班次天数（顺序按班次 sort_order）+ 节假日/周末上班天数 + 总工时。 */
+    /** 一行 = 全班次天数（顺序按班次 sort_order）+ 节假日/周末上班天数 + 总工时 + 值班电话天数。 */
     private static StatsRowVO rowOf(Staff staff, Map<String, ShiftType> shifts, RuleCalendar calendar,
-                                    List<SchedulePublishedEntry> entries) {
+                                    List<SchedulePublishedEntry> entries, int dutyPhoneDays) {
         Map<String, Integer> counts = new LinkedHashMap<>();
         for (String code : shifts.keySet()) {
             counts.put(code, 0);
@@ -168,7 +174,31 @@ public class StatsService {
             }
             totalHours = totalHours.add(shift.getWorkHours() == null ? BigDecimal.ZERO : shift.getWorkHours());
         }
-        return new StatsRowVO(staff.getId(), staff.getEmpNo(), staff.getName(), counts, offDayWork, totalHours);
+        return new StatsRowVO(staff.getId(), staff.getEmpNo(), staff.getName(), counts, offDayWork, totalHours,
+                dutyPhoneDays);
+    }
+
+    /**
+     * staffId → [from, to] 内值班电话天数，数据源 {@code duty_phone_published}（设计 §8.5）。
+     *
+     * <p>一行是一整周（周一到周日），统计区间常常把一周切掉一头——10-01 开始的统计不该把
+     * 9 月那周的前三天算进来，所以按天做交集而不是数周数。区间起点往前推 6 天查是因为
+     * {@code from} 不是周一时，包含它的那一周的 {@code week_start} 落在上个月。</p>
+     */
+    private Map<Long, Integer> dutyPhoneDays(LocalDate from, LocalDate to) {
+        Map<Long, Integer> days = new HashMap<>();
+        for (DutyPhonePublished row : dutyPublishedRepo
+                .findByWeekStartBetweenOrderByWeekStartAsc(from.minusDays(6), to)) {
+            LocalDate weekStart = row.getWeekStart();
+            LocalDate start = weekStart.isAfter(from) ? weekStart : from;
+            LocalDate weekEnd = weekStart.plusDays(6);
+            LocalDate end = weekEnd.isBefore(to) ? weekEnd : to;
+            if (start.isAfter(end)) {
+                continue;
+            }
+            days.merge(row.getStaffId(), (int) (ChronoUnit.DAYS.between(start, end) + 1), Integer::sum);
+        }
+        return days;
     }
 
     /** 快照按人分组；区间内一次查完，不按人逐个查（人数 × 天数会打出很多条 SQL）。 */
