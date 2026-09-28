@@ -24,12 +24,17 @@ import java.util.List;
  *
  * <p>默认模板是"按规则生成"不指定模板时的依据，也是该月"恢复规则默认"的落点，
  * 所以不允许把最后一个默认模板改掉（1804）或删掉（1802）。</p>
+ *
+ * <p>三个写操作都先取 {@code cycle_template} 的表级 advisory lock 再读写："读当前默认 → 摘掉它 → 写自己"
+ * 是跨语句的读—改—写，只靠部分唯一索引挡得住脏数据，挡不住输的一方撞索引落 500。</p>
  */
 @Service
 public class CycleTemplateService {
 
     /** V2 迁移里 cycle_template.name 的 UNIQUE 约束名 */
     static final String NAME_UNIQUE_CONSTRAINT = "cycle_template_name_key";
+    /** cycle_template 表级 advisory lock 的 key，库里固定只用一把（表只有几行，不存在粒度不够） */
+    static final int LOCK_KEY = 0;
 
     private final CycleTemplateRepository repo;
     private final ShiftTypeRepository shiftRepo;
@@ -52,6 +57,7 @@ public class CycleTemplateService {
     /** 新增模板；isDefault=true 时原来的默认模板先让位 */
     @Transactional
     public CycleTemplateVO create(CycleTemplateRequest req) {
+        lockTemplate();
         String name = validateName(req.name(), null);
         validateDays(req.days());
         if (req.isDefault()) {
@@ -79,6 +85,7 @@ public class CycleTemplateService {
      */
     @Transactional
     public CycleTemplateVO update(Long id, CycleTemplateRequest req) {
+        lockTemplate();
         CycleTemplate template = load(id);
         String name = validateName(req.name(), id);
         validateDays(req.days());
@@ -102,12 +109,26 @@ public class CycleTemplateService {
     /** 删除模板；库里 schedule_month.cycle_template_id 是 ON DELETE SET NULL，历史月份自动退回内置规则 */
     @Transactional
     public void delete(Long id) {
+        lockTemplate();
         CycleTemplate template = load(id);
         if (template.isDefaultTemplate()) {
             throw new BizException(1802, "默认模板不能删除");
         }
         repo.delete(template);
         opLog.record(OpAction.DELETE_CYCLE, template.getName(), "");
+    }
+
+    /**
+     * 取 cycle_template 的表级事务 advisory lock，必须是写方法的第一条语句。
+     *
+     * <p>“全表最多一个默认模板”要同时读旧默认、改旧默认、写自己，两个事务各自读到同一个旧默认
+     * 再去抢部分唯一索引时，输的一方会撞 {@code uq_cycle_template_default} 落 500。锁必须在任何读取
+     * 之前拿：先读后锁的话，本事务的持久化上下文里已经缓存了旧值，1804 / 1802 用的也是过期的默认标记。
+     * 锁对象是表这个常量（key 固定 0），不依赖任何可能变动的行——旧默认会被换掉，库里也可能一行默认都没有。
+     * 后到的事务在锁上等前一个提交，再读到最新的当前默认，所以两个请求都能成功。{@code list} 只读，不加锁。</p>
+     */
+    private void lockTemplate() {
+        repo.lockTemplate(LOCK_KEY);
     }
 
     /**

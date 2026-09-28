@@ -44,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -55,7 +56,8 @@ import static org.mockito.Mockito.when;
  * CycleTemplateService 的业务规则（V2 迁移里的约束在代码里的对应关系）。
  *
  * <p>打桩仓库、不连数据库；{@code saveAndFlush} 的调用顺序就是"全表最多一个默认模板"
- * 这条部分唯一索引能不能守住的关键，单独用 InOrder 断言。</p>
+ * 这条部分唯一索引能不能守住的关键，单独用 InOrder 断言；表级 advisory lock 抢在哪些读取
+ * 之前，同样只有 InOrder 才看得出来。</p>
  */
 class CycleTemplateServiceTest {
 
@@ -326,6 +328,90 @@ class CycleTemplateServiceTest {
         verify(opLog, never()).record(any(), any(), any());
     }
 
+    // -------------------------------------------------- 表级 advisory lock（写在任何读取之前）
+
+    /**
+     * 新增：先取表锁，再查重、再读当前默认。锁在后面读就只能读到加锁前别的事务提交的中间态，
+     * "摘掉旧默认"也会摘错行。
+     */
+    @Test
+    void createTakesTheTableLockBeforeAnyOtherRepositoryCall() {
+        CycleTemplate standard = template(1L, "标准周期", true, "D", "D", "D", "D", "D", "X", "X");
+        when(repo.findFirstByDefaultTemplateTrue()).thenReturn(Optional.of(standard));
+
+        service.create(request("夜班周期", true, "N", "N", "X", "X", "N", "N", "X"));
+
+        InOrder order = inOrder(repo);
+        order.verify(repo).lockTemplate(0);
+        order.verify(repo).existsByName("夜班周期");
+        order.verify(repo).findFirstByDefaultTemplateTrue();
+        order.verify(repo).saveAndFlush(standard);
+        order.verify(repo).saveAndFlush(any(CycleTemplate.class));
+        verify(repo, times(1)).lockTemplate(0);
+    }
+
+    /** 修改：load(id) 也要在锁后，否则 1804 判断用的是加锁前的 is_default */
+    @Test
+    void updateTakesTheTableLockBeforeAnyOtherRepositoryCall() {
+        CycleTemplate standard = template(1L, "标准周期", true, "D", "D", "D", "D", "D", "X", "X");
+        CycleTemplate night = template(3L, "夜班周期", false, "N", "N", "X", "X", "N", "N", "X");
+        when(repo.findById(3L)).thenReturn(Optional.of(night));
+        when(repo.findFirstByDefaultTemplateTrue()).thenReturn(Optional.of(standard));
+
+        service.update(3L, request("夜班周期", true, "N", "N", "X", "X", "N", "N", "X"));
+
+        InOrder order = inOrder(repo);
+        order.verify(repo).lockTemplate(0);
+        order.verify(repo).findById(3L);
+        order.verify(repo).existsByNameAndIdNot("夜班周期", 3L);
+        order.verify(repo).findFirstByDefaultTemplateTrue();
+        order.verify(repo).saveAndFlush(standard);
+        order.verify(repo).saveAndFlush(night);
+        verify(repo, times(1)).lockTemplate(0);
+    }
+
+    /** 删除也要锁：默认标记在锁前读，两个并发删除能把默认模板删干净 */
+    @Test
+    void deleteTakesTheTableLockBeforeAnyOtherRepositoryCall() {
+        CycleTemplate night = template(3L, "夜班周期", false, "N", "N", "X", "X", "N", "N", "X");
+        when(repo.findById(3L)).thenReturn(Optional.of(night));
+
+        service.delete(3L);
+
+        InOrder order = inOrder(repo);
+        order.verify(repo).lockTemplate(0);
+        order.verify(repo).findById(3L);
+        order.verify(repo).delete(night);
+        verify(repo, times(1)).lockTemplate(0);
+    }
+
+    /** 抛错的业务码也一样走了锁：1804 / 1802 用的 is_default 必须是加锁后读到的那一份 */
+    @Test
+    void rejectedWritesStillReadOnlyAfterTheLock() {
+        CycleTemplate standard = template(1L, "标准周期", true, "D", "D", "D", "D", "D", "X", "X");
+        when(repo.findById(1L)).thenReturn(Optional.of(standard));
+
+        assertEquals(1804, bizCode(() ->
+                service.update(1L, request("标准周期", false, "D", "D", "D", "D", "D", "X", "X"))));
+        assertEquals(1802, bizCode(() -> service.delete(1L)));
+
+        InOrder order = inOrder(repo);
+        order.verify(repo).lockTemplate(0); // update 那一轮
+        order.verify(repo).findById(1L);
+        order.verify(repo).lockTemplate(0); // delete 那一轮
+        order.verify(repo).findById(1L);
+        verify(repo, times(2)).lockTemplate(0);
+        verify(repo, never()).delete(any());
+    }
+
+    /** 列表只读，不加锁 */
+    @Test
+    void listDoesNotTakeTheTableLock() {
+        service.list();
+
+        verify(repo, never()).lockTemplate(anyInt());
+    }
+
     // -------------------------------------------------- 名称唯一约束兜底（并发）
 
     /** Hibernate + PostgreSQL 撞唯一约束时的真实异常形状 */
@@ -491,6 +577,16 @@ class CycleTemplateServiceTest {
 
     private static CycleTemplateRequest request(String name, boolean isDefault, String... days) {
         return new CycleTemplateRequest(name, List.of(days), isDefault);
+    }
+
+    /** 跑一段业务调用，返回它抛的业务码；没抛 BizException 或者抛了别的异常都算失败 */
+    private static int bizCode(Runnable body) {
+        try {
+            body.run();
+        } catch (BizException e) {
+            return e.getCode();
+        }
+        throw new AssertionError("期望抛业务码，但没有抛 BizException");
     }
 
     /** 一次假事务：成功提交，业务异常回滚并把错误码交给断言；其他异常照旧抛出，在测试里等于 500 */
