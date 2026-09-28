@@ -32,6 +32,13 @@ public final class OpAction {
     public static final String APPROVE_SWAP = "审批通过调班";
     public static final String REJECT_SWAP = "审批驳回调班";
 
+    public static final String CREATE_CYCLE = "新增排班周期";
+    public static final String UPDATE_CYCLE = "修改排班周期";
+    public static final String DELETE_CYCLE = "删除排班周期";
+    public static final String UPDATE_DUTY_PHONE_COLOR = "修改值班电话底色";
+    public static final String SAVE_DRAFT = "暂存排班";
+    public static final String SET_DUTY_PHONE = "设置值班电话";
+
     private OpAction() {
     }
 }
