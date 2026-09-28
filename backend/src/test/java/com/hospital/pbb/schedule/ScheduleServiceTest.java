@@ -159,6 +159,14 @@ class ScheduleServiceTest {
         return entry;
     }
 
+    /** 一周的值班电话草稿 */
+    private static DutyPhoneWeek dutyWeek(LocalDate weekStart, Long staffId) {
+        DutyPhoneWeek week = new DutyPhoneWeek();
+        week.setWeekStart(weekStart);
+        week.setStaffId(staffId);
+        return week;
+    }
+
     private static Holiday holiday(String name, String start, String end, HolidayType type) {
         Holiday holiday = new Holiday();
         holiday.setYear(LocalDate.parse(start).getYear());
@@ -207,6 +215,13 @@ class ScheduleServiceTest {
     private List<SchedulePublishedEntry> savedSnapshots() {
         ArgumentCaptor<List<SchedulePublishedEntry>> captor = ArgumentCaptor.captor();
         verify(publishedRepo).saveAll(captor.capture());
+        return captor.getValue();
+    }
+
+    /** 值班电话快照也是整段重写，saveAll 应恰好被调用一次 */
+    private List<DutyPhonePublished> savedDutySnapshots() {
+        ArgumentCaptor<List<DutyPhonePublished>> captor = ArgumentCaptor.captor();
+        verify(dutyPublishedRepo).saveAll(captor.capture());
         return captor.getValue();
     }
 
@@ -655,7 +670,7 @@ class ScheduleServiceTest {
         verify(entryRepo, never()).save(any(ScheduleEntry.class));
     }
 
-    /** 用例：先删旧快照再存新快照，且都在取到当月锁之后 */
+    /** 用例：先删旧快照再存新快照，且都在取到锁之后（10 月第一周落在 9 月 → 先 202609 后 202610） */
     @Test
     void publishDeletesOldSnapshotBeforeSavingNewOne() {
         when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
@@ -663,6 +678,7 @@ class ScheduleServiceTest {
         service.publish(YM, OPERATOR);
 
         InOrder order = inOrder(monthRepo, publishedRepo);
+        order.verify(monthRepo).lockMonth(SEP_LOCK_KEY);
         order.verify(monthRepo).lockMonth(LOCK_KEY);
         order.verify(publishedRepo).deleteByWorkDateRange(START, END);
         order.verify(publishedRepo).saveAll(any());
@@ -681,7 +697,7 @@ class ScheduleServiceTest {
         assertEquals(1, saved.getVersion());
         assertEquals(OPERATOR, saved.getPublishedBy());
         assertEquals(NOW, saved.getPublishedAt());
-        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v1，共3格");
+        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v1，共3格，值班电话0周");
     }
 
     /** 用例：月份 version=2 时再次发布 → 返回 version=3，快照上的 version 跟着走 */
@@ -696,7 +712,80 @@ class ScheduleServiceTest {
         assertEquals(3, result.count());
         assertEquals(3, savedMonth().getVersion());
         assertEquals(3, savedSnapshots().get(0).getVersion());
-        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v3，共3格");
+        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v3，共3格，值班电话0周");
+    }
+
+    /** 用例：发布 2026-10，草稿有 09-28、10-05 两周 → 先 lockMonth(202609) 后 lockMonth(202610)，
+     *  已发布值班电话按 09-28..10-31 整段重写为 2 条（任务单 M4-13） */
+    @Test
+    void publishCopiesDutyPhoneWeeksAndLocksPreviousMonthWhenFirstWeekCrosses() {
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
+        when(dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(WEEK_SEP_OCT, END))
+                .thenReturn(List.of(dutyWeek(WEEK_SEP_OCT, 1L), dutyWeek(WEEK_IN_OCT, 2L)));
+
+        service.publish(YM, OPERATOR);
+
+        InOrder order = inOrder(monthRepo, publishedRepo, dutyPublishedRepo);
+        order.verify(monthRepo).lockMonth(SEP_LOCK_KEY);
+        order.verify(monthRepo).lockMonth(LOCK_KEY);
+        order.verify(publishedRepo).saveAll(any());
+        order.verify(dutyPublishedRepo).deleteByWeekStartRange(WEEK_SEP_OCT, END);
+        order.verify(dutyPublishedRepo).saveAll(any());
+        verify(monthRepo, times(1)).lockMonth(SEP_LOCK_KEY);
+        verify(monthRepo, times(1)).lockMonth(LOCK_KEY);
+
+        List<DutyPhonePublished> saved = savedDutySnapshots();
+        assertEquals(2, saved.size());
+        assertEquals(WEEK_SEP_OCT, saved.get(0).getWeekStart());
+        assertEquals(1L, saved.get(0).getStaffId());
+        assertEquals(WEEK_IN_OCT, saved.get(1).getWeekStart());
+        assertEquals(2L, saved.get(1).getStaffId());
+        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v1，共3格，值班电话2周");
+    }
+
+    /** 用例：发布 2026-06（06-01 本身就是周一）→ 只 lockMonth(202606)，重写范围从 06-01 起 */
+    @Test
+    void publishLocksOnlyCurrentMonthWhenFirstWeekStartsOnTheFirst() {
+        LocalDate junStart = LocalDate.of(2026, 6, 1);
+        LocalDate junEnd = LocalDate.of(2026, 6, 30);
+        when(entryRepo.findByWorkDateBetween(junStart, junEnd)).thenReturn(List.of(draft(1L, junStart, "D", false)));
+        when(dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(junStart, junEnd))
+                .thenReturn(List.of(dutyWeek(junStart, 1L)));
+
+        service.publish("2026-06", OPERATOR);
+
+        verify(monthRepo, times(1)).lockMonth(202606);
+        verify(monthRepo, never()).lockMonth(202605);
+        verify(dutyPublishedRepo).deleteByWeekStartRange(junStart, junEnd);
+        List<DutyPhonePublished> saved = savedDutySnapshots();
+        assertEquals(1, saved.size());
+        assertEquals(junStart, saved.get(0).getWeekStart());
+        assertEquals(1L, saved.get(0).getStaffId());
+    }
+
+    /** 用例：草稿里一周值班电话也没有 → 已发布范围被清空（保存 0 条），发布仍然成功 */
+    @Test
+    void publishClearsDutyPhoneSnapshotWhenDraftHasNoWeek() {
+        when(entryRepo.findByWorkDateBetween(START, END)).thenReturn(threeDrafts());
+        when(dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(WEEK_SEP_OCT, END)).thenReturn(List.of());
+
+        PublishResultVO result = service.publish(YM, OPERATOR);
+
+        assertEquals(new PublishResultVO(1, 3), result);
+        verify(dutyPublishedRepo).deleteByWeekStartRange(WEEK_SEP_OCT, END);
+        assertEquals(List.of(), savedDutySnapshots());
+        verify(opLog).record(OpAction.PUBLISH_SCHEDULE, YM, "版本 v1，共3格，值班电话0周");
+    }
+
+    /** 用例：整月无草稿 → 仍抛 1504，已发布值班电话一字不改 */
+    @Test
+    void publishRejectsMonthWithoutDraftAndLeavesDutyPhoneSnapshotAlone() {
+        BizException e = assertThrows(BizException.class, () -> service.publish(YM, OPERATOR));
+
+        assertEquals(1504, e.getCode());
+        verify(dutyRepo, never()).findByWeekStartBetweenOrderByWeekStartAsc(any(), any());
+        verify(dutyPublishedRepo, never()).deleteByWeekStartRange(any(), any());
+        verify(dutyPublishedRepo, never()).saveAll(any());
     }
 
     /** 用例：整月无草稿 → 1504，旧快照不能被误删 */
