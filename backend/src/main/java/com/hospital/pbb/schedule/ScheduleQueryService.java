@@ -3,10 +3,12 @@ package com.hospital.pbb.schedule;
 import com.hospital.pbb.holiday.HolidayRepository;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.DayVO;
+import com.hospital.pbb.schedule.dto.DutyPhoneVO;
 import com.hospital.pbb.schedule.dto.MineDayVO;
 import com.hospital.pbb.schedule.dto.MineVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.StaffRowVO;
+import com.hospital.pbb.shift.AppSetting;
 import com.hospital.pbb.shift.AppSettingRepository;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
@@ -46,11 +48,10 @@ public class ScheduleQueryService {
     private final HolidayRepository holidayRepo;
     private final ShiftTypeRepository shiftRepo;
     private final Clock clock;
-    /** 下面三个仓库从 M4-06（月视图返回值班电话与底色）起使用，本单只注入不使用 */
+    /** 值班电话草稿 / 已发布快照与系统设置：M4-06 起月视图用它们带出标亮信息，一律只读 */
     private final DutyPhoneWeekRepository dutyRepo;
     private final DutyPhonePublishedRepository dutyPublishedRepo;
     private final AppSettingRepository settingRepo;
-
     public ScheduleQueryService(ScheduleMonthRepository monthRepo, ScheduleEntryRepository entryRepo,
                                 SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
                                 HolidayRepository holidayRepo, ShiftTypeRepository shiftRepo, Clock clock,
@@ -110,7 +111,72 @@ public class ScheduleQueryService {
                 month != null ? month.getStatus() : ScheduleStatus.DRAFT,
                 month != null ? month.getVersion() : 0,
                 month != null ? month.getPublishedAt() : null,
-                draft, days, rows);
+                draft, days, rows,
+                month != null ? month.getCycleTemplateId() : null,
+                dutyPhoneColor(), dutyPhones(ym, draft));
+    }
+
+    /**
+     * 与本月有交集的各周值班电话（设计 §8.4、§8.5）。
+     *
+     * <p>周从"含本月 1 日的那一周"的周一起算（{@link ScheduleMonths#firstWeekStart}），
+     * 所以跨月那一周在上个月和本个月的表里都会出现，两边显示同一个人。
+     * 草稿读 {@code duty_phone_week}、已发布读 {@code duty_phone_published}，
+     * 与排班格子走的是同一个 {@code draft} 开关。</p>
+     */
+    private List<DutyPhoneVO> dutyPhones(YearMonth ym, boolean draft) {
+        LocalDate from = ScheduleMonths.firstWeekStart(ym);
+        LocalDate to = ym.atEndOfMonth();
+        // 查询本身已按 weekStart 升序，LinkedHashMap 保序即可保证返回顺序
+        Map<LocalDate, Long> staffIdByWeek = draft
+                ? draftDutyPhones(from, to) : publishedDutyPhones(from, to);
+        if (staffIdByWeek.isEmpty()) {
+            return List.of();
+        }
+        Map<Long, String> nameById = nameById(staffIdByWeek.values().stream().distinct().toList());
+
+        List<DutyPhoneVO> phones = new ArrayList<>(staffIdByWeek.size());
+        for (Map.Entry<LocalDate, Long> row : staffIdByWeek.entrySet()) {
+            LocalDate weekStart = row.getKey();
+            phones.add(new DutyPhoneVO(weekStart, weekStart.plusDays(6), row.getValue(),
+                    nameById.getOrDefault(row.getValue(), "")));
+        }
+        return phones;
+    }
+
+    /** 值班电话负责人 id → 姓名，按 id 批量取一次，不逐周查库。 */
+    private Map<Long, String> nameById(List<Long> staffIds) {
+        Map<Long, String> names = new HashMap<>();
+        for (Staff staff : staffRepo.findAllById(staffIds)) {
+            names.put(staff.getId(), staff.getName());
+        }
+        return names;
+    }
+
+    private Map<LocalDate, Long> draftDutyPhones(LocalDate from, LocalDate to) {
+        Map<LocalDate, Long> staffIdByWeek = new LinkedHashMap<>();
+        for (DutyPhoneWeek row : dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(from, to)) {
+            staffIdByWeek.put(row.getWeekStart(), row.getStaffId());
+        }
+        return staffIdByWeek;
+    }
+
+    private Map<LocalDate, Long> publishedDutyPhones(LocalDate from, LocalDate to) {
+        Map<LocalDate, Long> staffIdByWeek = new LinkedHashMap<>();
+        for (DutyPhonePublished row : dutyPublishedRepo.findByWeekStartBetweenOrderByWeekStartAsc(from, to)) {
+            staffIdByWeek.put(row.getWeekStart(), row.getStaffId());
+        }
+        return staffIdByWeek;
+    }
+
+    /**
+     * 值班电话底色：{@code app_setting} 由 shift 模块唯一写入（§8.2），这里只读；
+     * 没有这一项（或迁移未跑）时退回默认黄色，不让整张表没有底色。
+     */
+    private String dutyPhoneColor() {
+        return settingRepo.findById(AppSetting.DUTY_PHONE_COLOR)
+                .map(AppSetting::getValue)
+                .orElse(AppSetting.DEFAULT_DUTY_PHONE_COLOR);
     }
 
     /**

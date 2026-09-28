@@ -78,7 +78,8 @@ class ScreenServiceTest {
     }
 
     private static MonthScheduleVO month(String yearMonth) {
-        return new MonthScheduleVO(yearMonth, ScheduleStatus.PUBLISHED, 1, null, false, List.of(), List.of());
+        return new MonthScheduleVO(yearMonth, ScheduleStatus.PUBLISHED, 1, null, false, List.of(), List.of(),
+                null, "#fde047", List.of());
     }
 
     /** 用例 1：A、D 两人白班只计数，夜班/值班/请假按人员顺序出姓名 */

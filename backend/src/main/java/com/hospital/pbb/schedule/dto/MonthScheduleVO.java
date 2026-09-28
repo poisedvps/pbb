@@ -15,6 +15,10 @@ import java.util.List;
  * @param draft      true 表示返回的是草稿（科长），false 表示已发布快照（成员、大屏）
  * @param days       当月每一天，按月内日期升序
  * @param rows       参与排班的人员，按 sort_order、id 升序
+ * @param cycleTemplateId 该月最近一次按规则生成所用的周期模板 id，从没生成过或模板已删除时为 null
+ * @param dutyPhoneColor  值班电话整格标亮用的底色（{@code #RRGGBB}），app_setting 无记录时为默认黄色
+ * @param dutyPhones  与该月有交集的各周值班电话，按 weekStart 升序，不含手机号
  */
 public record MonthScheduleVO(String yearMonth, ScheduleStatus status, int version, OffsetDateTime publishedAt,
-                              boolean draft, List<DayVO> days, List<StaffRowVO> rows) {}
+                              boolean draft, List<DayVO> days, List<StaffRowVO> rows,
+                              Long cycleTemplateId, String dutyPhoneColor, List<DutyPhoneVO> dutyPhones) {}

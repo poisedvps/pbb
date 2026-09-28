@@ -6,10 +6,12 @@ import com.hospital.pbb.holiday.HolidayRepository;
 import com.hospital.pbb.holiday.HolidayType;
 import com.hospital.pbb.schedule.dto.CellVO;
 import com.hospital.pbb.schedule.dto.DayVO;
+import com.hospital.pbb.schedule.dto.DutyPhoneVO;
 import com.hospital.pbb.schedule.dto.MineDayVO;
 import com.hospital.pbb.schedule.dto.MineVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.StaffRowVO;
+import com.hospital.pbb.shift.AppSetting;
 import com.hospital.pbb.shift.AppSettingRepository;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
@@ -427,5 +429,137 @@ class ScheduleQueryServiceTest {
         when(publishedRepo.findByStaffIdAndWorkDate(1L, day)).thenReturn(Optional.empty());
 
         assertEquals(Optional.empty(), service.publishedShift(1L, day));
+    }
+
+    // ===== 以下是"月视图返回值班电话、底色与周期模板"（任务单 M4-06）=====
+
+    /** 2026-10-01 是周四，含它的那一周从 9-28 开始，所以取值班电话要看到上个月（设计 §8.4） */
+    private static final LocalDate FIRST_WEEK_START = LocalDate.of(2026, 9, 28);
+
+    private static DutyPhoneWeek dutyDraft(Long staffId, String weekStart) {
+        DutyPhoneWeek row = new DutyPhoneWeek();
+        row.setWeekStart(LocalDate.parse(weekStart));
+        row.setStaffId(staffId);
+        return row;
+    }
+
+    private static DutyPhonePublished dutyPublished(Long staffId, String weekStart) {
+        DutyPhonePublished row = new DutyPhonePublished();
+        row.setWeekStart(LocalDate.parse(weekStart));
+        row.setStaffId(staffId);
+        return row;
+    }
+
+    /** 值班电话只用到 id 和姓名 */
+    private static Staff named(Long id, String name) {
+        Staff staff = new Staff();
+        staff.setId(id);
+        staff.setEmpNo("E" + id);
+        staff.setName(name);
+        staff.setPosition("护士");
+        staff.setSchedulable(true);
+        staff.setActive(true);
+        return staff;
+    }
+
+    private static AppSetting setting(String color) {
+        AppSetting appSetting = new AppSetting();
+        appSetting.setKey(AppSetting.DUTY_PHONE_COLOR);
+        appSetting.setValue(color);
+        return appSetting;
+    }
+
+    /** 用例 1、3：draft=true 读草稿表，查询范围是 (2026-09-28, 2026-10-31)，跨月那一周也带出来 */
+    @Test
+    void draftMonthCarriesDutyPhoneWeeksIncludingTheCrossMonthWeek() {
+        when(dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(FIRST_WEEK_START, END))
+                .thenReturn(List.of(dutyDraft(1L, "2026-09-28"), dutyDraft(2L, "2026-10-05")));
+        when(staffRepo.findAllById(List.of(1L, 2L))).thenReturn(List.of(named(1L, "张三"), named(2L, "李四")));
+
+        MonthScheduleVO vo = service.getMonth(YM, true);
+
+        assertEquals(List.of(
+                        new DutyPhoneVO(FIRST_WEEK_START, LocalDate.of(2026, 10, 4), 1L, "张三"),
+                        new DutyPhoneVO(LocalDate.of(2026, 10, 5), LocalDate.of(2026, 10, 11), 2L, "李四")),
+                vo.dutyPhones());
+        // weekEnd = weekStart + 6，前端按 weekStart..weekEnd 与当月的交集标亮
+        verify(dutyRepo).findByWeekStartBetweenOrderByWeekStartAsc(LocalDate.of(2026, 9, 28), LocalDate.of(2026, 10, 31));
+        verify(dutyPublishedRepo, never()).findByWeekStartBetweenOrderByWeekStartAsc(any(), any());
+    }
+
+    /** 用例 2：draft=false 只读已发布快照，草稿表一次都不查 */
+    @Test
+    void publishedMonthCarriesPublishedDutyPhoneOnly() {
+        when(dutyPublishedRepo.findByWeekStartBetweenOrderByWeekStartAsc(FIRST_WEEK_START, END))
+                .thenReturn(List.of(dutyPublished(1L, "2026-09-28")));
+        when(staffRepo.findAllById(List.of(1L))).thenReturn(List.of(named(1L, "张三")));
+
+        MonthScheduleVO vo = service.getMonth(YM, false);
+
+        assertEquals(List.of(new DutyPhoneVO(FIRST_WEEK_START, LocalDate.of(2026, 10, 4), 1L, "张三")),
+                vo.dutyPhones());
+        verify(dutyRepo, never()).findByWeekStartBetweenOrderByWeekStartAsc(any(), any());
+    }
+
+    /** 同一人连任两周：只查一次人员表，两条记录都带出姓名 */
+    @Test
+    void dutyPhoneStaffIdsAreDeduplicatedBeforeLookup() {
+        when(dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(FIRST_WEEK_START, END))
+                .thenReturn(List.of(dutyDraft(1L, "2026-09-28"), dutyDraft(1L, "2026-10-05")));
+        when(staffRepo.findAllById(List.of(1L))).thenReturn(List.of(named(1L, "张三")));
+
+        MonthScheduleVO vo = service.getMonth(YM, true);
+
+        assertEquals(List.of("张三", "张三"), vo.dutyPhones().stream().map(DutyPhoneVO::name).toList());
+        verify(staffRepo).findAllById(List.of(1L));
+    }
+
+    /** 人员已被删除（id 查不到）→ name 为空串，但 staffId 照带，前端仍能标亮 */
+    @Test
+    void dutyPhoneNameIsEmptyWhenStaffNotFound() {
+        when(dutyRepo.findByWeekStartBetweenOrderByWeekStartAsc(FIRST_WEEK_START, END))
+                .thenReturn(List.of(dutyDraft(7L, "2026-10-12")));
+        when(staffRepo.findAllById(List.of(7L))).thenReturn(List.of());
+
+        assertEquals(List.of(new DutyPhoneVO(LocalDate.of(2026, 10, 12), LocalDate.of(2026, 10, 18), 7L, "")),
+                service.getMonth(YM, true).dutyPhones());
+    }
+
+    /** app_setting 里没有 duty_phone_color 这一项 → 默认黄色 #fde047 */
+    @Test
+    void dutyPhoneColorFallsBackToDefaultWhenSettingMissing() {
+        when(settingRepo.findById(AppSetting.DUTY_PHONE_COLOR)).thenReturn(Optional.empty());
+
+        assertEquals(AppSetting.DEFAULT_DUTY_PHONE_COLOR, service.getMonth(YM, true).dutyPhoneColor());
+        assertEquals("#fde047", service.getMonth(YM, true).dutyPhoneColor());
+    }
+
+    /** app_setting 里有值就原样带出 */
+    @Test
+    void dutyPhoneColorComesFromAppSetting() {
+        when(settingRepo.findById(AppSetting.DUTY_PHONE_COLOR)).thenReturn(Optional.of(setting("#ff0000")));
+
+        assertEquals("#ff0000", service.getMonth(YM, true).dutyPhoneColor());
+    }
+
+    /** schedule_month 里记了模板 → 原样带出 cycleTemplateId */
+    @Test
+    void cycleTemplateIdComesFromScheduleMonth() {
+        ScheduleMonth month = monthRow(2);
+        month.setCycleTemplateId(3L);
+        when(monthRepo.findById(YM)).thenReturn(Optional.of(month));
+
+        assertEquals(3L, service.getMonth(YM, true).cycleTemplateId());
+    }
+
+    /** 用例：schedule_month 没有该月记录 → cycleTemplateId 为 null，值班电话为空列表 */
+    @Test
+    void cycleTemplateIdIsNullWhenMonthRecordMissing() {
+        MonthScheduleVO vo = service.getMonth(YM, true);
+
+        assertNull(vo.cycleTemplateId());
+        assertEquals(List.of(), vo.dutyPhones());
+        // 该月没有任何值班电话时不去查人员表
+        verify(staffRepo, never()).findAllById(any());
     }
 }
