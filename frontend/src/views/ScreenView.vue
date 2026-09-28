@@ -30,6 +30,11 @@
         <div class="card-label">今日请假</div>
         <div class="card-value names">{{ names(today?.leave) }}</div>
       </div>
+      <!-- 第五张卡片只出姓名，手机号一律不上大屏（设计 §8.6） -->
+      <div class="card">
+        <div class="card-label">本周值班电话</div>
+        <div class="card-value names">{{ weekDutyName }}</div>
+      </div>
     </div>
 
     <div class="grid-wrap">
@@ -48,7 +53,8 @@
         <tbody>
           <tr v-for="row in pageRows" :key="row.staffId">
             <td class="name">{{ row.name }}</td>
-            <td v-for="day in days" :key="day.date" :class="{ now: day.date === todayDate }">
+            <td v-for="day in days" :key="day.date" :class="{ now: day.date === todayDate }"
+                :style="isDutyCell(row.staffId, day.date) ? { background: month.dutyPhoneColor } : null">
               <span v-if="cellOf(row, day.date)" class="chip" :style="chipStyle(row, day.date)">{{ chipText(row, day.date) }}</span>
             </td>
           </tr>
@@ -58,6 +64,7 @@
 
     <div class="foot">
       <span v-if="paged" class="page">第 {{ page }}/{{ totalPages }} 页 · 每 15 秒自动翻页</span>
+      <span class="legend"><i class="swatch" :style="{ background: month?.dutyPhoneColor }"></i>值班电话</span>
       <span class="sp"></span>
       <span>数据每 5 分钟自动刷新 · 仅显示已发布排班</span>
     </div>
@@ -169,6 +176,18 @@ const pageRows = computed(() => {
 const shiftByCode = computed(() => Object.fromEntries(shifts.value.map((s) => [s.code, s])))
 const cellOf = (row, date) => row.cells?.[date] || null
 
+const dutyPhones = computed(() => month.value?.dutyPhones || [])
+
+// 值班电话负责人当周 7 天整格标亮（设计 §8.5）。weekStart/weekEnd 是 YYYY-MM-DD，与 day.date 同为字符串，直接比大小即可，
+// 跨月的那一周在两个月的大屏里都会命中
+const isDutyCell = (staffId, date) =>
+  dutyPhones.value.some((d) => d.weekStart <= date && date <= d.weekEnd && d.staffId === staffId)
+
+// 本周谁在值值班电话：本周没有已发布的记录（或人员已删、name 为空串）时显示“—”
+const weekDutyName = computed(
+  () => dutyPhones.value.find((d) => d.weekStart <= todayDate.value && todayDate.value <= d.weekEnd)?.name || '—',
+)
+
 // 班次被停用后快照里仍带着它的 code，取不到就退成灰底代号，不留白格
 const chipStyle = (row, date) => ({ background: shiftByCode.value[cellOf(row, date).shiftCode]?.color || '#9ca3af' })
 const chipText = (row, date) => shiftByCode.value[cellOf(row, date).shiftCode]?.name || cellOf(row, date).shiftCode
@@ -227,7 +246,7 @@ const onExit = async () => {
 .clock { font-size: 5.4vh; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; color: #fff; }
 .today { font-size: 1.9vh; color: #94a3b8; margin-top: 0.4vh; }
 
-.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.2vw; margin: 2.2vh 0; }
+.cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1.2vw; margin: 2.2vh 0; }
 .card { background: #111c33; border: 1px solid #1e293b; border-radius: 8px; padding: 1.4vh 1vw; min-height: 9vh; overflow: hidden; }
 .card-label { font-size: 1.7vh; color: #94a3b8; }
 .card-value { font-size: 2.6vh; font-weight: 700; color: #fff; margin-top: 0.8vh; line-height: 1.3; }
@@ -286,4 +305,6 @@ table.grid td { min-width: 3.4vw; }
 }
 .foot .sp { flex: 1; }
 .foot .page { color: #93c5fd; }
+.foot .legend { display: inline-flex; align-items: center; gap: 6px; }
+.foot .swatch { display: inline-block; width: 1.6vh; height: 1.6vh; border-radius: 3px; border: 1px solid rgba(229, 231, 235, 0.3); }
 </style>
