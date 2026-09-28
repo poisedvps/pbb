@@ -10,6 +10,7 @@ import com.hospital.pbb.schedule.dto.MineDayVO;
 import com.hospital.pbb.schedule.dto.MineVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.StaffRowVO;
+import com.hospital.pbb.shift.AppSettingRepository;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
 import com.hospital.pbb.staff.Staff;
@@ -61,6 +62,9 @@ class ScheduleQueryServiceTest {
     private StaffRepository staffRepo;
     private HolidayRepository holidayRepo;
     private ShiftTypeRepository shiftRepo;
+    private DutyPhoneWeekRepository dutyRepo;
+    private DutyPhonePublishedRepository dutyPublishedRepo;
+    private AppSettingRepository settingRepo;
     private ScheduleQueryService service;
 
     @BeforeEach
@@ -71,9 +75,12 @@ class ScheduleQueryServiceTest {
         staffRepo = mock(StaffRepository.class);
         holidayRepo = mock(HolidayRepository.class);
         shiftRepo = mock(ShiftTypeRepository.class);
+        dutyRepo = mock(DutyPhoneWeekRepository.class);
+        dutyPublishedRepo = mock(DutyPhonePublishedRepository.class);
+        settingRepo = mock(AppSettingRepository.class);
         Clock clock = Clock.fixed(TODAY.atStartOfDay(ZONE).toInstant(), ZONE);
         service = new ScheduleQueryService(monthRepo, entryRepo, publishedRepo, staffRepo, holidayRepo,
-                shiftRepo, clock);
+                shiftRepo, clock, dutyRepo, dutyPublishedRepo, settingRepo);
 
         // 默认：没有任何节假日、排班数据，schedule_month 里也还没有这一月
         when(holidayRepo.findOverlapping(any(), any())).thenReturn(List.of());

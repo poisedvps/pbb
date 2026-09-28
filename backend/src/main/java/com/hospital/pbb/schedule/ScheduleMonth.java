@@ -43,6 +43,10 @@ public class ScheduleMonth {
     @Column(name = "published_by")
     private Long publishedBy;
 
+    /** 最近一次按规则生成所用的周期模板 id；为 null 时按内置规则 */
+    @Column(name = "cycle_template_id")
+    private Long cycleTemplateId;
+
     public String getYearMonth() {
         return yearMonth;
     }
@@ -81,5 +85,13 @@ public class ScheduleMonth {
 
     public void setPublishedBy(Long publishedBy) {
         this.publishedBy = publishedBy;
+    }
+
+    public Long getCycleTemplateId() {
+        return cycleTemplateId;
+    }
+
+    public void setCycleTemplateId(Long cycleTemplateId) {
+        this.cycleTemplateId = cycleTemplateId;
     }
 }

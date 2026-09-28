@@ -1,6 +1,7 @@
 package com.hospital.pbb.stats;
 
 import com.hospital.pbb.common.BizException;
+import com.hospital.pbb.schedule.DutyPhonePublishedRepository;
 import com.hospital.pbb.schedule.RuleCalendar;
 import com.hospital.pbb.schedule.SchedulePublishedEntry;
 import com.hospital.pbb.schedule.SchedulePublishedEntryRepository;
@@ -43,13 +44,17 @@ public class StatsService {
     private final StaffRepository staffRepo;
     private final ShiftTypeRepository shiftRepo;
     private final ScheduleQueryService query;
+    /** M4-07 统计值班电话天数起使用，本单只注入不使用 */
+    private final DutyPhonePublishedRepository dutyPublishedRepo;
 
     public StatsService(SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
-                        ShiftTypeRepository shiftRepo, ScheduleQueryService query) {
+                        ShiftTypeRepository shiftRepo, ScheduleQueryService query,
+                        DutyPhonePublishedRepository dutyPublishedRepo) {
         this.publishedRepo = publishedRepo;
         this.staffRepo = staffRepo;
         this.shiftRepo = shiftRepo;
         this.query = query;
+        this.dutyPublishedRepo = dutyPublishedRepo;
     }
 
     /**

@@ -7,6 +7,7 @@ import com.hospital.pbb.schedule.dto.MineDayVO;
 import com.hospital.pbb.schedule.dto.MineVO;
 import com.hospital.pbb.schedule.dto.MonthScheduleVO;
 import com.hospital.pbb.schedule.dto.StaffRowVO;
+import com.hospital.pbb.shift.AppSettingRepository;
 import com.hospital.pbb.shift.ShiftType;
 import com.hospital.pbb.shift.ShiftTypeRepository;
 import com.hospital.pbb.staff.Staff;
@@ -45,10 +46,16 @@ public class ScheduleQueryService {
     private final HolidayRepository holidayRepo;
     private final ShiftTypeRepository shiftRepo;
     private final Clock clock;
+    /** 下面三个仓库从 M4-06（月视图返回值班电话与底色）起使用，本单只注入不使用 */
+    private final DutyPhoneWeekRepository dutyRepo;
+    private final DutyPhonePublishedRepository dutyPublishedRepo;
+    private final AppSettingRepository settingRepo;
 
     public ScheduleQueryService(ScheduleMonthRepository monthRepo, ScheduleEntryRepository entryRepo,
                                 SchedulePublishedEntryRepository publishedRepo, StaffRepository staffRepo,
-                                HolidayRepository holidayRepo, ShiftTypeRepository shiftRepo, Clock clock) {
+                                HolidayRepository holidayRepo, ShiftTypeRepository shiftRepo, Clock clock,
+                                DutyPhoneWeekRepository dutyRepo, DutyPhonePublishedRepository dutyPublishedRepo,
+                                AppSettingRepository settingRepo) {
         this.monthRepo = monthRepo;
         this.entryRepo = entryRepo;
         this.publishedRepo = publishedRepo;
@@ -56,6 +63,9 @@ public class ScheduleQueryService {
         this.holidayRepo = holidayRepo;
         this.shiftRepo = shiftRepo;
         this.clock = clock;
+        this.dutyRepo = dutyRepo;
+        this.dutyPublishedRepo = dutyPublishedRepo;
+        this.settingRepo = settingRepo;
     }
 
     /**
