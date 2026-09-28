@@ -10,6 +10,7 @@ export const menuRoutes = [
   { path: 'stats', name: 'stats', component: () => import('../views/StatsView.vue'), meta: { title: '统计报表', group: '排班' } },
   { path: 'staff', name: 'staff', component: () => import('../views/StaffView.vue'), meta: { title: '人员管理', group: '基础设置', admin: true } },
   { path: 'holiday', name: 'holiday', component: () => import('../views/HolidayView.vue'), meta: { title: '节假日', group: '基础设置', admin: true } },
+  { path: 'cycles', name: 'cycles', component: () => import('../views/CycleView.vue'), meta: { title: '排班周期', group: '基础设置', admin: true } },
   { path: 'shifts', name: 'shifts', component: () => import('../views/ShiftsView.vue'), meta: { title: '班次设置', group: '基础设置', admin: true } },
   { path: 'users', name: 'users', component: () => import('../views/UsersView.vue'), meta: { title: '账号管理', group: '系统', admin: true } },
   { path: 'logs', name: 'logs', component: () => import('../views/LogsView.vue'), meta: { title: '操作日志', group: '系统', admin: true } }
