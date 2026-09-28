@@ -29,7 +29,7 @@
       >
         暂存（{{ pendingCount }}）
       </el-button>
-      <el-button v-if="auth.isAdmin" :disabled="pendingCount === 0 || monthLocked || saving" @click="dropPending">放弃修改</el-button>
+      <el-button v-if="auth.isAdmin" :disabled="pendingCount === 0 || monthLocked || saving || loading" @click="dropPending">放弃修改</el-button>
       <el-button v-if="auth.isAdmin" type="primary" :loading="working" :disabled="monthLocked || saving || loading" @click="publish">发布排班</el-button>
     </div>
 
@@ -57,11 +57,12 @@
               {{ row.name }}
               <small>{{ row.empNo }}</small>
             </td>
-            <!-- 只有科长能改格子，成员挂了同一个 onClick 也在 openEditor 里被挡回去 -->
+            <!-- 只有科长能改格子，成员挂了同一个 onClick 也在 openEditor 里被挡回去；
+                 切月请求在途时屏幕上还是旧月那份数据，不开格子 -->
             <td
               v-for="day in days"
               :key="day.date"
-              :class="{ cell: auth.isAdmin, pending: isPending(row, day.date) }"
+              :class="{ cell: cellEditable, pending: isPending(row, day.date) }"
               @click="openEditor(row, day.date)"
             >
               <span
@@ -119,7 +120,7 @@
     />
     <template #footer>
       <el-button :disabled="saving" @click="editorVisible = false">取消</el-button>
-      <el-button type="primary" :disabled="saving" @click="confirmPick">确定</el-button>
+      <el-button type="primary" :disabled="saving || loading" @click="confirmPick">确定</el-button>
     </template>
   </el-dialog>
 </template>
@@ -154,13 +155,28 @@ const saving = ref(false)
 // 未暂存的格子修改：key = `${staffId}|${workDate}`，点【暂存】才一次性发给后端（设计 §8.1 第 1 条）
 // value = { staffId, workDate, shiftCode（null=恢复规则默认）, remark }
 const pendingCells = ref({})
+// 这批修改属于哪个月：切月的请求还在路上时屏幕上仍是旧月那份数据，
+// 不绑月份就会把旧月的 workDate 和新月的 viewYm() 拼到同一个 PUT 里（后端 1503 整月拒）
+const pendingYm = ref('')
 // 未暂存修改的数量（M4-15 会把值班电话的数量加进来）
 const pendingCount = computed(() => Object.keys(pendingCells.value).length)
 const cellKey = (staffId, date) => `${staffId}|${date}`
-const pendingOf = (row, date) => pendingCells.value[cellKey(row.staffId, date)] || null
+const pendingOf = (row, date) =>
+  pendingYm.value !== '' && pendingYm.value === viewYm() ? pendingCells.value[cellKey(row.staffId, date)] || null : null
 const isPending = (row, date) => !!pendingOf(row, date)
+// 格子什么时候能改：切月的 GET 在途 / 暂存未完成 / 整月重写在写时，屏幕上挂的都可能是旧一份数据，
+// 这时候开格或确定就会把旧数据上的修改当成当前这份表的内容存下来
+const cellEditable = computed(
+  () => auth.isAdmin && !loading.value && !saving.value && !working.value && !monthLocked.value
+)
 const clearPending = () => {
   pendingCells.value = {}
+  pendingYm.value = ''
+}
+
+// 新月份的数据落地后，旧月那批待暂存修改在新这份表上没有对应的格子，整批丢弃
+const dropPendingOutside = (target) => {
+  if (pendingYm.value && pendingYm.value !== target) clearPending()
 }
 
 // 快速连点 ‹ › 会并发发出多个 getSchedule，慢的旧响应不能盖掉新的月份
@@ -172,10 +188,20 @@ const reload = async (target = ym.value) => {
   try {
     const resp = await getSchedule(target)
     // 慢的旧响应既不能盖掉新月份，也不能盖掉科长已经翻过去的视图
-    if (seq === reqSeq && target === ym.value) data.value = resp
+    if (seq === reqSeq && target === ym.value) {
+      data.value = resp
+      // 屏幕换成新月份的数据后，旧月那批待暂存修改没有格子可显示了，不能跟着新月份发出去
+      dropPendingOutside(resp?.yearMonth)
+      // 旧月份开着的弹窗里那一格已经不在屏幕上，一并关掉
+      if (editYm.value && editYm.value !== resp?.yearMonth) editorVisible.value = false
+    }
   } catch {
     // 失败提示由 http 拦截器统一弹出；旧请求失败不动当前数据
-    if (seq === reqSeq && target === ym.value) data.value = null
+    if (seq === reqSeq && target === ym.value) {
+      data.value = null
+      // 屏幕上没有表了，待暂存的修改也没有格子可指，只能跟着丢掉
+      clearPending()
+    }
   } finally {
     if (seq === reqSeq) loading.value = false
   }
@@ -358,6 +384,8 @@ const publish = () =>
 const editorVisible = ref(false)
 const editRow = ref(null)
 const editDate = ref('')
+// 弹窗打开时屏幕上那个月：旧月开的弹窗不能把修改写进新月份的待暂存集合
+const editYm = ref('')
 const pick = ref(DEFAULT_PICK)
 const remark = ref('')
 
@@ -368,11 +396,11 @@ const editorTitle = computed(() => {
 })
 
 const openEditor = (row, date) => {
-  // 暂存请求还没落地前不让再开一格：重载完成会把这一格的待暂存值一起换掉，弹窗里的内容会对不上
-  if (!auth.isAdmin || saving.value || monthLocked.value) return
+  if (!cellEditable.value) return
   const cell = viewCell(row, date)
   editRow.value = row
   editDate.value = date
+  editYm.value = viewYm()
   // 未暂存的修改优先于后端值，重开弹窗时预选的就是科长自己刚改上去的那个值；
   // 没排过班（整月还没生成过）时没有当前值，落在「恢复规则默认」上
   pick.value = cell?.shiftCode ?? DEFAULT_PICK
@@ -382,9 +410,17 @@ const openEditor = (row, date) => {
 
 // 【确定】只写页面：不发请求，同一格再改一次就是覆盖
 const confirmPick = () => {
+  // 切月的数据还在路上：此刻屏幕上这份表随时会被换掉，先不把这一格写进待暂存
+  if (loading.value) return
   const staffId = editRow.value?.staffId
   const workDate = editDate.value
-  if (!staffId || !workDate) return
+  // 弹窗开着的时候屏幕已经换月：这一格不属于现在这张表，关掉弹窗而不是写错月份
+  if (!staffId || !workDate || editYm.value !== viewYm()) {
+    editorVisible.value = false
+    return
+  }
+  // 待暂存的永远只属于一个月；月份变了就是上一批该整批作废（切月本应先清掉，这里是兜底）
+  if (pendingYm.value && pendingYm.value !== editYm.value) clearPending()
   pendingCells.value = {
     ...pendingCells.value,
     [cellKey(staffId, workDate)]: {
@@ -394,6 +430,7 @@ const confirmPick = () => {
       remark: remark.value.trim() || null
     }
   }
+  pendingYm.value = editYm.value
   editorVisible.value = false
 }
 
@@ -412,6 +449,13 @@ const saveDraftNow = async () => {
   const target = viewYm()
   const entries = Object.values(pendingCells.value)
   if (!target || entries.length === 0) return
+  // 兜底：一批待暂存的日期必须全属于要发的那个月，否则后端会整批拒（1503）。
+  // 走到这里说明页面和数据对不上，宁可作废这批修改也不发跨月日期
+  if (pendingYm.value !== target || entries.some((e) => !e.workDate.startsWith(target))) {
+    clearPending()
+    ElMessage.warning('待暂存的修改不属于当前月份，已作废，请重新修改')
+    return
+  }
   saving.value = true
   try {
     await saveDraft(target, { entries, dutyPhones: [] })
