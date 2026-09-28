@@ -39,6 +39,34 @@
       夜班 / 值班 / 备班 / 请假在此基础上<b>手工调整</b>（手工改过的格子下方显示橙色线）。
     </div>
 
+    <!-- 值班电话按周指定负责人（设计 §8.1 第 3 条）：跨月那一周的周一落在上个月，
+         也要照常出现在本月的选择器里，不能按“属于本月”过滤掉 -->
+    <div v-if="weeks.length > 0 && (auth.isAdmin || memberDuty.length > 0)" class="duty">
+      <b>值班电话：</b>
+      <template v-if="auth.isAdmin">
+        <span v-for="w in weeks" :key="w.weekStart" class="wk">
+          <span class="wk-no">{{ w.label }}</span>
+          <el-select
+            class="duty-sel"
+            :model-value="dutyByWeek[w.weekStart] ?? null"
+            :disabled="!cellEditable"
+            clearable
+            placeholder="未设置"
+            @update:model-value="(v) => setDuty(w.weekStart, v)"
+          >
+            <el-option v-for="r in rows" :key="r.staffId" :label="r.name" :value="r.staffId" />
+          </el-select>
+        </span>
+      </template>
+      <!-- 成员读的是已发布那一份，没有安排值班电话的周不显示 -->
+      <template v-else>
+        <span v-for="d in memberDuty" :key="d.weekStart" class="wk">
+          <span class="wk-no">{{ d.label }}</span>
+          <b>{{ d.name }}</b>
+        </span>
+      </template>
+    </div>
+
     <div v-loading="loading" class="grid-wrap">
       <table class="grid">
         <thead>
@@ -63,6 +91,7 @@
               v-for="day in days"
               :key="day.date"
               :class="{ cell: cellEditable, pending: isPending(row, day.date) }"
+              :style="isDutyCell(row.staffId, day.date) ? { background: data?.dutyPhoneColor } : null"
               @click="openEditor(row, day.date)"
             >
               <span
@@ -86,6 +115,9 @@
       <div class="legend">
         <span v-for="s in shifts" :key="s.code">
           <i class="swatch" :style="{ background: s.color }"></i>{{ s.name }}
+        </span>
+        <span v-if="data?.dutyPhoneColor" class="duty-legend">
+          <i class="swatch" :style="{ background: data.dutyPhoneColor }"></i>值班电话
         </span>
       </div>
       <div class="sp"></div>
@@ -158,8 +190,13 @@ const pendingCells = ref({})
 // 这批修改属于哪个月：切月的请求还在路上时屏幕上仍是旧月那份数据，
 // 不绑月份就会把旧月的 workDate 和新月的 viewYm() 拼到同一个 PUT 里（后端 1503 整月拒）
 const pendingYm = ref('')
-// 未暂存修改的数量（M4-15 会把值班电话的数量加进来）
-const pendingCount = computed(() => Object.keys(pendingCells.value).length)
+// 未暂存的值班电话：key = weekStart（YYYY-MM-DD），value = staffId 或 null（清除该周）
+// 与 pendingCells 同属 pendingYm 这一批，切月 / 新月数据落地时一并作废
+const pendingDuty = ref({})
+// 未暂存修改的数量：格子数 + 值班电话周数
+const pendingCount = computed(
+  () => Object.keys(pendingCells.value).length + Object.keys(pendingDuty.value).length
+)
 const cellKey = (staffId, date) => `${staffId}|${date}`
 const pendingOf = (row, date) =>
   pendingYm.value !== '' && pendingYm.value === viewYm() ? pendingCells.value[cellKey(row.staffId, date)] || null : null
@@ -171,6 +208,7 @@ const cellEditable = computed(
 )
 const clearPending = () => {
   pendingCells.value = {}
+  pendingDuty.value = {}
   pendingYm.value = ''
 }
 
@@ -285,6 +323,82 @@ const visibleRows = computed(() => {
   if (!kw) return rows.value
   return rows.value.filter((r) => (r.name || '').includes(kw) || (r.empNo || '').includes(kw))
 })
+
+// ===== 值班电话（设计 §8.1 第 3 条、§8.5“标亮”）=====
+const fmtDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+// 日期加减一律走本地 Date，不用 UTC（UTC 换算会把日期错一天）
+const shiftDate = (date, delta) => {
+  const [y, m, dd] = date.split('-').map(Number)
+  return fmtDate(new Date(y, m - 1, dd + delta))
+}
+const shortDate = (date) => `${Number(date.slice(5, 7))}/${Number(date.slice(8, 10))}`
+
+// 本月涉及的周：与本月有交集的所有周，通常 5 个、最多 6 个。
+// 起点是月初那天所在周的周一（可能在上个月），逐个 +7 天，直到周一晚于月末
+const weeks = computed(() => {
+  const list = days.value
+  if (list.length === 0) return []
+  const monthEnd = list[list.length - 1].date
+  let weekStart = shiftDate(list[0].date, -((list[0].weekday || 1) - 1))
+  const out = []
+  while (weekStart <= monthEnd) {
+    const weekEnd = shiftDate(weekStart, 6)
+    out.push({ weekStart, weekEnd, label: `${shortDate(weekStart)}–${shortDate(weekEnd)}` })
+    weekStart = shiftDate(weekStart, 7)
+  }
+  return out
+})
+
+// 未暂存的值班电话只在它所属的那个月生效：切月请求在途时屏幕上还是旧一份数据，
+// 不能让旧月选的值班电话盖到新月的表上（与格子的 pendingOf 同一个约束）
+const pendingDutyMap = computed(() =>
+  pendingYm.value !== '' && pendingYm.value === viewYm() ? pendingDuty.value : {}
+)
+
+// 当前生效（含未暂存）的值班电话：weekStart → staffId；pendingDuty 里值为 null 是清除该周
+const dutyByWeek = computed(() => {
+  const map = {}
+  for (const d of data.value?.dutyPhones || []) map[d.weekStart] = d.staffId
+  for (const [weekStart, staffId] of Object.entries(pendingDutyMap.value)) {
+    if (staffId === null || staffId === undefined) delete map[weekStart]
+    else map[weekStart] = staffId
+  }
+  return map
+})
+
+// 某人某天是否值班电话：先找 date 落在哪一周（字符串日期直接比大小即可）
+const isDutyCell = (staffId, date) => {
+  const week = weeks.value.find((w) => w.weekStart <= date && date <= w.weekEnd)
+  return !!week && dutyByWeek.value[week.weekStart] === staffId
+}
+
+const dutyName = (weekStart) => {
+  const staffId = dutyByWeek.value[weekStart]
+  const row = rows.value.find((r) => r.staffId === staffId)
+  if (row) return row.name
+  // 人员已不参与排班时退回后端带的姓名（DutyPhoneVO.name，查不到时为空串）
+  return (data.value?.dutyPhones || []).find((d) => d.weekStart === weekStart)?.name || ''
+}
+
+// 成员只看已发布的安排，没排到值班电话的周不显示
+const memberDuty = computed(() =>
+  weeks.value
+    .filter((w) => dutyByWeek.value[w.weekStart] !== undefined && dutyByWeek.value[w.weekStart] !== null)
+    .map((w) => ({ weekStart: w.weekStart, label: w.label, name: dutyName(w.weekStart) }))
+)
+
+// 选择只写页面，点【暂存】才发给后端；el-select 清空时传的是 ''，统一换成 null
+const setDuty = (weekStart, value) => {
+  // 切月的数据还在路上 / 暂存或整月重写在途：此刻屏幕上这份表随时会被换掉，先不写
+  if (!cellEditable.value) return
+  const target = viewYm()
+  if (!target) return
+  // 与格子同属一批：月份换了就是上一批该整批作废（切月本应先清掉，这里是兜底）
+  if (pendingYm.value && pendingYm.value !== target) clearPending()
+  const staffId = value === '' || value === undefined ? null : value
+  pendingDuty.value = { ...pendingDuty.value, [weekStart]: staffId }
+  pendingYm.value = target
+}
 
 const shiftByCode = computed(() => Object.fromEntries(shifts.value.map((s) => [s.code, s])))
 // 停用的班次不能选，但表格里它的历史格子照常显示
@@ -448,8 +562,14 @@ const saveDraftNow = async () => {
   if (saving.value) return
   const target = viewYm()
   const entries = Object.values(pendingCells.value)
-  if (!target || entries.length === 0) return
-  // 兜底：一批待暂存的日期必须全属于要发的那个月，否则后端会整批拒（1503）。
+  // 只送这次改过的周：staffId 为 null 就是取消该周的值班电话
+  // weekStart 不做“属于本月”的校验：跨月那一周的周一本来就在上个月（设计 §8.5 步骤 1 的 1506 只要求与本月有交集）
+  const dutyPhones = Object.entries(pendingDuty.value).map(([weekStart, staffId]) => ({
+    weekStart,
+    staffId: staffId === undefined ? null : staffId
+  }))
+  if (!target || (entries.length === 0 && dutyPhones.length === 0)) return
+  // 兜底：一批待暂存的格子日期必须全属于要发的那个月，否则后端会整批拒（1503）。
   // 走到这里说明页面和数据对不上，宁可作废这批修改也不发跨月日期
   if (pendingYm.value !== target || entries.some((e) => !e.workDate.startsWith(target))) {
     clearPending()
@@ -458,13 +578,17 @@ const saveDraftNow = async () => {
   }
   saving.value = true
   try {
-    await saveDraft(target, { entries, dutyPhones: [] })
+    await saveDraft(target, { entries, dutyPhones })
     clearPending()
-    ElMessage.success(`已暂存 ${entries.length} 处修改`)
+    ElMessage.success(
+      dutyPhones.length === 0
+        ? `已暂存 ${entries.length} 处修改`
+        : `已暂存 ${entries.length} 处修改，值班电话 ${dutyPhones.length} 周`
+    )
     // 只在还停在这一个月时刷新视图；换月了就把屏幕留给那边的请求
     if (viewYm() === target && ym.value === target) await reload(target)
   } catch {
-    // 失败提示由 http 拦截器统一弹出（如 1503 日期不在本月）；pendingCells 原样保留
+    // 失败提示由 http 拦截器统一弹出（如 1503 日期不在本月）；pendingCells / pendingDuty 原样保留
   } finally {
     saving.value = false
   }
@@ -488,6 +612,20 @@ const saveDraftNow = async () => {
 }
 
 .grid-wrap { overflow-x: auto; border: 1px solid #e3e7ee; border-radius: 6px; }
+
+/* 值班电话一行：每周一组「9/28–10/4 [选择器]」，窄屏自动换行 */
+.duty {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.duty .wk { display: inline-flex; align-items: center; gap: 6px; }
+.duty .wk-no { color: #6b7280; }
+.duty .duty-sel { width: 150px; }
+
 /* 表头与姓名列都要 sticky，border-collapse 会丢边框，所以用 separate */
 table.grid { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; }
 table.grid th, table.grid td {
