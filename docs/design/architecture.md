@@ -1,6 +1,7 @@
-# 医院信息科排班表 · 架构设计 v1.0
+# 医院信息科排班表 · 架构设计 v1.1
 
 > 需求来源：需求方确认记录（2026-09-27）；界面以 `docs/design/prototype/index.html`（原型 v0.2）为准。
+> v1.1（2026-09-28）：新增暂存草稿、排班周期模板、值班电话（需求 SWO-49，需求方 2026-09-28 确认），增量设计见 §8。
 
 ## 1. 需求要点（已确认）
 
@@ -129,6 +130,9 @@ for 每个 schedulable 且 active 的人员 s:
 | 1500–1504 | schedule | 月份格式应为 YYYY-MM / 人员不存在或不参与排班 / 班次不存在或已停用 / 日期不在该月内 / 本月还没有排班 |
 | 1600–1609 | swap | 申请不存在 / 账号未关联人员 / 没有已发布的班次（含“排班已变化”） / 只能申请今天及以后 / 对方不能是自己 / 对方人员无效 / 缺少对方人员或日期 / 该日期已有进行中的申请 / 当前状态不允许此操作 / 无权操作该申请 |
 | 1700–1701 | stats | 开始日期晚于结束日期 / 统计范围超过 366 天 |
+| 1304 | shift | 颜色格式应为 #RRGGBB（值班电话底色，M4） |
+| 1505–1507 | schedule | 值班电话的周起始日必须是周一 / 该周与本月没有交集 / 排班周期模板不存在（M4） |
+| 1800–1804 | cycle | 排班周期模板不存在 / 模板名称已存在 / 默认模板不能删除 / 模板中的班次不存在或已停用 / 至少保留一个默认模板（M4） |
 
 ### 5.2 排班数据结构
 
@@ -174,3 +178,157 @@ for 每个 schedulable 且 active 的人员 s:
 | M1 | 认证与账号、人员、班次、节假日（任务单见 `docs/design/tasks/M1.md`） |
 | M2 | 排班表（生成/编辑/发布）、我的排班、大屏（任务单见 `docs/design/tasks/M2.md`） |
 | M3 | 调班申请、统计报表、导出、操作日志、本机部署与冒烟验收（任务单见 `docs/design/tasks/M3.md`） |
+| M4 | 暂存草稿、排班周期模板、值班电话及其统计（设计见 §8，任务单见 `docs/design/tasks/M4.md`） |
+
+## 8. M4 增量：暂存草稿、排班周期、值班电话（v1.1）
+
+### 8.1 需求确认记录（需求方 2026-09-28）
+
+| # | 需求 | 确认结论 |
+|---|---|---|
+| 1 | 暂存 | 排班表页改为“先在页面上批量修改，点【暂存】才一次性保存到草稿；点【发布】才对外可见”。有未暂存修改时，切月、离开页面、按规则生成、发布都要先提醒 |
+| 2 | 排班周期 | 做成**多种周期模板**：每个模板规定周一至周日各排什么班；按规则生成时选择模板。法定节假日仍为休息 X、调休上班日仍为白班 D（沿用 §1 第 3 条） |
+| 3 | 值班电话 | 每周（周一至周日）指定 1 人负责接听值班电话，只能从“参与排班”的人员中选；此人当周 7 天（含周六、周日，与当天班次无关）的格子**整格底色**标亮，班次文字不变。跨月的那一周在两个月的排班表里都标亮。大屏同样标亮，但**不显示电话号码** |
+| 4 | 底色 | 默认黄色 `#fde047`，在“班次设置”页可改 |
+| 5 | 生效 | 值班电话安排与排班一起走“草稿 → 发布”，发布后成员与大屏才可见 |
+| 6 | 统计 | 统计报表增加“值班电话（天）”列，按区间内的天数统计，并进入 Excel 导出 |
+| 7 | 调班 | 值班电话不参与调班申请，只由科长在排班表里改 |
+
+### 8.2 模块划分（增量）
+
+| 模块 | 后端包 | 前端 | 新增职责 |
+|---|---|---|---|
+| cycle（新） | `cycle` | `views/CycleView.vue`（菜单“基础设置 / 排班周期”）、`api/cycles.js` | 周期模板增删改查 |
+| shift | `shift` | `views/ShiftsView.vue`、`api/settings.js` | 值班电话底色（`app_setting` 表的唯一写入方） |
+| schedule | `schedule` | `views/ScheduleView.vue` | 批量暂存、按模板生成、值班电话草稿与发布 |
+| screen | `screen` | `views/ScreenView.vue` | 读 `MonthScheduleVO.dutyPhones` 标亮，后端无改动 |
+| stats | `stats` | `views/StatsView.vue` | 值班电话天数、导出列 |
+
+模块边界补充：
+- 只有 schedule 写 `duty_phone_week`、`duty_phone_published` 和 `schedule_month.cycle_template_id`；只有 cycle 写 `cycle_template`；只有 shift 写 `app_setting`。
+- schedule 只读 `cycle_template`（按规则生成、恢复规则默认）与 `app_setting`（月视图带出底色）；stats 只读 `duty_phone_published`。
+
+### 8.3 数据表（Flyway `V2__cycle_template_duty_phone.sql`）
+
+```sql
+-- 系统设置（键值），目前只有值班电话底色一项
+CREATE TABLE app_setting (
+    setting_key    VARCHAR(64)  PRIMARY KEY,
+    setting_value  VARCHAR(200) NOT NULL,
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+INSERT INTO app_setting (setting_key, setting_value) VALUES ('duty_phone_color', '#fde047');
+
+-- 排班周期模板：day1..day7 = 周一..周日的班次代号
+CREATE TABLE cycle_template (
+    id          BIGSERIAL    PRIMARY KEY,
+    name        VARCHAR(32)  NOT NULL UNIQUE,
+    day1        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    day2        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    day3        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    day4        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    day5        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    day6        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    day7        VARCHAR(4)   NOT NULL REFERENCES shift_type (code),
+    is_default  BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+-- 最多一个默认模板
+CREATE UNIQUE INDEX uq_cycle_template_default ON cycle_template (is_default) WHERE is_default;
+INSERT INTO cycle_template (name, day1, day2, day3, day4, day5, day6, day7, is_default)
+VALUES ('标准周期', 'D', 'D', 'D', 'D', 'D', 'X', 'X', TRUE);
+
+-- 该月最近一次按规则生成所用模板；“恢复规则默认”按它重算。模板被删时置空，退回内置规则
+ALTER TABLE schedule_month
+    ADD COLUMN cycle_template_id BIGINT REFERENCES cycle_template (id) ON DELETE SET NULL;
+
+-- 值班电话草稿：一周一行，week_start 必须是周一
+CREATE TABLE duty_phone_week (
+    week_start  DATE         PRIMARY KEY CHECK (EXTRACT(ISODOW FROM week_start) = 1),
+    staff_id    BIGINT       NOT NULL REFERENCES staff (id),
+    updated_by  BIGINT REFERENCES app_user (id),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+-- 值班电话已发布快照（成员、大屏、统计读）
+CREATE TABLE duty_phone_published (
+    week_start  DATE         PRIMARY KEY CHECK (EXTRACT(ISODOW FROM week_start) = 1),
+    staff_id    BIGINT       NOT NULL REFERENCES staff (id)
+);
+```
+
+**“某月涉及的周”**：`week_start` 从“该月 1 日所在周的周一”（可能落在上个月）到该月最后一天，即与该月有交集的所有周，通常 5 周，最多 6 周。由 `ScheduleMonths.firstWeekStart(ym)` 统一计算。
+
+### 8.4 接口（增量）
+
+| 方法 | 路径 | 角色 | 说明 |
+|---|---|---|---|
+| GET | `/cycle-templates` | ADMIN | 模板列表，按 id 升序 |
+| POST | `/cycle-templates` | ADMIN | `{name, days[7], isDefault}` → `CycleTemplateVO` |
+| PUT | `/cycle-templates/{id}` | ADMIN | 同上 |
+| DELETE | `/cycle-templates/{id}` | ADMIN | 默认模板不能删（1802） |
+| GET | `/settings/duty-phone-color` | 登录 | `{color}` |
+| PUT | `/settings/duty-phone-color` | ADMIN | `{color}`，须为 `#RRGGBB`（1304） |
+| POST | `/schedules/{yearMonth}/generate?templateId=` | ADMIN | **改**：`templateId` 可省略，省略时用默认模板 |
+| PUT | `/schedules/{yearMonth}/draft` | ADMIN | **新**：暂存，`{entries[], dutyPhones[]}` 一次性保存，全部成功或全部不生效 |
+| GET | `/schedules/{yearMonth}` | 登录 | **改**：返回体新增 `cycleTemplateId`、`dutyPhoneColor`、`dutyPhones[]` |
+| POST | `/schedules/{yearMonth}/publish` | ADMIN | **改**：同时发布该月涉及各周的值班电话 |
+| GET | `/stats` · `/stats/export` | ADMIN / MEMBER | **改**：每行新增 `dutyPhoneDays`；导出在“节假日/周末上班”与“总工时”之间新增“值班电话（天）”列 |
+
+`PUT /schedules/{yearMonth}/entries`（单格保存）保留，前端不再使用。
+
+```java
+// 周期模板
+public record CycleTemplateVO(Long id, String name, List<String> days, boolean isDefault) {}   // days: 7 个班次代号，下标 0=周一
+public record CycleTemplateRequest(@NotBlank @Size(max = 32) String name,
+                                   @NotNull @Size(min = 7, max = 7) List<@NotBlank String> days,
+                                   boolean isDefault) {}
+// 值班电话底色
+public record DutyPhoneColorVO(String color) {}
+// 暂存
+public record DutyPhoneChange(@NotNull LocalDate weekStart, Long staffId) {}        // staffId=null 表示清除该周
+public record SaveDraftRequest(@NotNull @Size(max = 2000) List<@Valid UpdateEntryRequest> entries,
+                               @NotNull @Size(max = 6) List<@Valid DutyPhoneChange> dutyPhones) {}
+public record SaveDraftResultVO(int entries, int dutyPhones) {}
+// 月视图新增
+public record DutyPhoneVO(LocalDate weekStart, LocalDate weekEnd, Long staffId, String name) {}
+// MonthScheduleVO(yearMonth, status, version, publishedAt, draft, days, rows,
+//                 Long cycleTemplateId, String dutyPhoneColor, List<DutyPhoneVO> dutyPhones)
+// StatsRowVO(staffId, empNo, name, counts, offDayWork, totalHours, int dutyPhoneDays)
+```
+
+### 8.5 关键流程
+
+**按模板生成**（改 §4 算法中的默认值计算，其余不变）：
+
+```
+template = templateId != null ? 按 id 取（不存在 → 1507） : 默认模板（没有默认模板 → null）
+template 中任何一天的班次不存在或已停用 → 1502
+默认班次(d)：
+  d 为调休上班日（WORKDAY 类型节假日）→ D
+  d 为放假日（HOLIDAY 类型节假日）     → X
+  否则                                 → template == null ? (周末 X / 工作日 D) : template.days[星期几-1]
+生成结束后 schedule_month.cycle_template_id = template?.id
+```
+
+“恢复规则默认”（单格或暂存里 `shiftCode=null`）按该月 `cycle_template_id` 对应模板计算；为空时用内置规则。
+
+**暂存 `PUT /schedules/{ym}/draft`**：
+1. 先校验全部内容，任何一条不合法就报错、一条都不写：格子日期在该月内（1503）、人员有效（1501）、班次启用（1502）；值班电话 `weekStart` 是周一（1505）、该周与该月有交集（1506）、`staffId` 非 null 时人员有效（1501）。
+2. 取锁：该月，以及每个值班电话周所跨的月份（`YearMonth.from(weekStart)`、`YearMonth.from(weekStart+6)`），去重后升序逐个 `lockMonth`。
+3. 逐格写草稿，写法与单格保存相同（含每格一条 `修改排班` 日志）。
+4. 逐周写值班电话草稿：`staffId` 为 null 删除该周，否则新增或覆盖；每周一条 `设置值班电话` 日志，detail 为姓名或“清除”。
+5. 涉及的月份（第 2 步的全部月份）都打回 DRAFT；记一条 `暂存排班` 日志，detail=`{n}格，值班电话{m}周`。
+
+**发布**（在 §4 发布流程后追加）：删除 `duty_phone_published` 中该月涉及各周的行，再把 `duty_phone_week` 中同范围的行整体复制过去。加锁时若该月第一周的周一落在上个月，先取上个月的锁再取本月的锁（升序），避免与上个月的发布同时写同一周。
+跨月那一周以**最近一次发布（无论哪个月）**时的草稿为准，两个月的排班表显示同一个人。
+
+**标亮**：前端对每个 `dutyPhones[i]`，把 `staffId` 对应行中 `weekStart..weekEnd` 且落在本月的格子 `td` 背景设为 `dutyPhoneColor`；班次色块与文字不变。科长看草稿，成员与大屏看已发布。
+
+**统计**：`dutyPhoneDays` = 该人在 `duty_phone_published` 中各周的 7 天与 `[from, to]` 交集的天数之和（与当天班次无关）。
+
+### 8.6 安全
+
+- 所有写接口仅 ADMIN（`@PreAuthorize("hasRole('ADMIN')")`）；新增写操作都记操作日志。
+- 大屏与值班电话相关的展示只出现姓名，不出现手机号；月视图 `DutyPhoneVO` 不含手机号字段。
