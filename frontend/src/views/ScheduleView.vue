@@ -4,11 +4,12 @@
       <div class="head">
         <b>排班表</b>
         <el-tag v-if="data" :type="statusTag.type" size="small">{{ statusTag.text }}</el-tag>
+        <el-tag v-if="pendingCount > 0" type="danger" size="small">有 {{ pendingCount }} 处未暂存</el-tag>
       </div>
     </template>
 
     <div class="toolbar">
-      <!-- 整月写入与保存进行到时不许切月：确认文案说的是哪个月，请求就只能打给哪个月 -->
+      <!-- 整月写入与暂存进行到时不许切月：确认文案说的是哪个月，请求就只能打给哪个月 -->
       <el-button :disabled="monthLocked || saving" @click="prevMonth">‹</el-button>
       <b class="month">{{ monthText }}</b>
       <el-button :disabled="monthLocked || saving" @click="nextMonth">›</el-button>
@@ -18,6 +19,17 @@
       <el-button :disabled="loading" @click="exportExcel">导出 Excel</el-button>
       <el-button @click="print">打印</el-button>
       <el-button v-if="auth.isAdmin" class="screen-btn" @click="openScreen">🖥 大屏展示</el-button>
+      <!-- 暂存把页面上的待暂存修改一次性写回草稿；有未暂存修改时发布仍可点，由 runOnMonth 弹提示拦下 -->
+      <el-button
+        v-if="auth.isAdmin"
+        type="primary"
+        :loading="saving"
+        :disabled="pendingCount === 0 || monthLocked || saving || loading"
+        @click="saveDraftNow"
+      >
+        暂存（{{ pendingCount }}）
+      </el-button>
+      <el-button v-if="auth.isAdmin" :disabled="pendingCount === 0 || monthLocked || saving" @click="dropPending">放弃修改</el-button>
       <el-button v-if="auth.isAdmin" type="primary" :loading="working" :disabled="monthLocked || saving || loading" @click="publish">发布排班</el-button>
     </div>
 
@@ -46,10 +58,19 @@
               <small>{{ row.empNo }}</small>
             </td>
             <!-- 只有科长能改格子，成员挂了同一个 onClick 也在 openEditor 里被挡回去 -->
-            <td v-for="day in days" :key="day.date" :class="{ cell: auth.isAdmin }" @click="openEditor(row, day.date)">
-              <span v-if="cellOf(row, day.date)" class="chip" :class="{ manual: cellOf(row, day.date).manual }" :style="chipStyle(row, day.date)">{{
-                chipText(row, day.date)
-              }}</span>
+            <td
+              v-for="day in days"
+              :key="day.date"
+              :class="{ cell: auth.isAdmin, pending: isPending(row, day.date) }"
+              @click="openEditor(row, day.date)"
+            >
+              <span
+                v-if="viewCell(row, day.date)"
+                class="chip"
+                :class="{ manual: viewCell(row, day.date).manual, plain: viewCell(row, day.date).shiftCode === null }"
+                :style="chipStyle(row, day.date)"
+                >{{ chipText(row, day.date) }}</span
+              >
             </td>
           </tr>
           <tr class="cov">
@@ -67,11 +88,11 @@
         </span>
       </div>
       <div class="sp"></div>
-      <span v-if="auth.isAdmin" class="note">点击单元格修改班次；底部行 = 每日在岗人数</span>
+      <span v-if="auth.isAdmin" class="note">点击单元格修改班次，修改后点【暂存】保存；底部行 = 每日在岗人数</span>
     </div>
   </el-card>
 
-  <!-- 改格子：选中班次后保存；「恢复规则默认」把 shiftCode 交回后端按规则重算 -->
+  <!-- 改格子：【确定】只把修改留在页面上，点【暂存】才发给后端；「恢复规则默认」存 shiftCode=null -->
   <el-dialog v-model="editorVisible" :title="editorTitle" width="520px">
     <div class="opts">
       <button
@@ -98,15 +119,16 @@
     />
     <template #footer>
       <el-button :disabled="saving" @click="editorVisible = false">取消</el-button>
-      <el-button type="primary" :loading="saving" @click="saveEntry">保存</el-button>
+      <el-button type="primary" :disabled="saving" @click="confirmPick">确定</el-button>
     </template>
   </el-dialog>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { generateSchedule, getSchedule, publishSchedule, updateEntry } from '../api/schedules'
+import { onBeforeRouteLeave } from 'vue-router'
+import { generateSchedule, getSchedule, publishSchedule, saveDraft } from '../api/schedules'
 import { download } from '../api/download'
 import { listShiftTypes } from '../api/shifts'
 import { useAuthStore } from '../stores/auth'
@@ -126,6 +148,20 @@ const keyword = ref('')
 const loading = ref(false)
 // 生成与发布都会整月重写，互斥进行，按钮共用一个忙碌态
 const working = ref(false)
+// 暂存请求进行中
+const saving = ref(false)
+
+// 未暂存的格子修改：key = `${staffId}|${workDate}`，点【暂存】才一次性发给后端（设计 §8.1 第 1 条）
+// value = { staffId, workDate, shiftCode（null=恢复规则默认）, remark }
+const pendingCells = ref({})
+// 未暂存修改的数量（M4-15 会把值班电话的数量加进来）
+const pendingCount = computed(() => Object.keys(pendingCells.value).length)
+const cellKey = (staffId, date) => `${staffId}|${date}`
+const pendingOf = (row, date) => pendingCells.value[cellKey(row.staffId, date)] || null
+const isPending = (row, date) => !!pendingOf(row, date)
+const clearPending = () => {
+  pendingCells.value = {}
+}
 
 // 快速连点 ‹ › 会并发发出多个 getSchedule，慢的旧响应不能盖掉新的月份
 let reqSeq = 0
@@ -145,7 +181,16 @@ const reload = async (target = ym.value) => {
   }
 }
 
+// 页面上还有未暂存的修改时，关掉浏览器/刷新都由浏览器弹原生离开提示
+const beforeUnload = (e) => {
+  if (pendingCount.value === 0) return
+  e.preventDefault()
+  e.returnValue = ''
+}
+
 onMounted(async () => {
+  // 监听要在拉到数据之前就挂上：数据请求失败也不能让刷新绕过离开保护
+  window.addEventListener('beforeunload', beforeUnload)
   reload()
   try {
     shifts.value = await listShiftTypes()
@@ -154,9 +199,22 @@ onMounted(async () => {
   }
 })
 
-const shiftMonth = (delta) => {
-  // 整月写入或保存还挂在半途时切月，会让在途请求的目标月份和屏幕上的月份对不上
+onUnmounted(() => window.removeEventListener('beforeunload', beforeUnload))
+
+// 左侧菜单、面包屑等站内跳走：同样要确认，取消就留在本页
+onBeforeRouteLeave(async () => {
+  if (pendingCount.value === 0) return true
+  return confirmBox(`有 ${pendingCount.value} 处修改未暂存，切换页面将放弃这些修改，是否继续？`, '离开排班表')
+})
+
+const shiftMonth = async (delta) => {
+  // 整月写入或暂存还挂在半途时切月，会让在途请求的目标月份和屏幕上的月份对不上
   if (monthLocked.value || saving.value) return
+  if (pendingCount.value > 0) {
+    const ok = await confirmBox(`有 ${pendingCount.value} 处修改未暂存，切换月份将放弃这些修改，是否继续？`, '切换月份')
+    if (!ok) return
+    clearPending()
+  }
   const [y, m] = ym.value.split('-').map(Number)
   const date = new Date(y, m - 1 + delta, 1)
   ym.value = `${date.getFullYear()}-${pad(date.getMonth() + 1)}`
@@ -208,12 +266,27 @@ const enabledShifts = computed(() => shifts.value.filter((s) => s.enabled))
 
 const cellOf = (row, date) => row.cells?.[date] || null
 
+// 屏幕上这一格当前该显示什么：未暂存的修改优先于后端数据，
+// shiftCode=null 表示科长选了「恢复规则默认」，它也是一次修改，不能当成空格
+const viewCell = (row, date) => {
+  const pending = pendingOf(row, date)
+  if (pending) return { shiftCode: pending.shiftCode, remark: pending.remark, manual: false }
+  return cellOf(row, date)
+}
+
 // 班次被停用后旧排班仍带着它的 code，取不到就退成灰底代号，不留白格
 const chipStyle = (row, date) => {
-  const shift = shiftByCode.value[cellOf(row, date).shiftCode]
+  const cell = viewCell(row, date)
+  // 「恢复规则默认」没有色块，灰字由 .chip.plain 负责
+  if (cell.shiftCode === null) return {}
+  const shift = shiftByCode.value[cell.shiftCode]
   return { background: shift?.color || '#9ca3af' }
 }
-const chipText = (row, date) => shiftByCode.value[cellOf(row, date).shiftCode]?.name || cellOf(row, date).shiftCode
+const chipText = (row, date) => {
+  const code = viewCell(row, date).shiftCode
+  if (code === null) return '默认'
+  return shiftByCode.value[code]?.name || code
+}
 
 const dayNo = (date) => Number(date.slice(8, 10))
 const WD = ['一', '二', '三', '四', '五', '六', '日']
@@ -240,8 +313,13 @@ const confirmBox = (message, title) =>
 const monthLocked = ref(false)
 
 const runOnMonth = async (action, message, title, done) => {
-  // 保存没过、上一份月数据没落定之前不发起整月写入，免得两条写入交错在同一张表上
+  // 暂存没过、上一份月数据没落定之前不发起整月写入，免得两条写入交错在同一张表上
   if (working.value || monthLocked.value || saving.value || loading.value) return
+  // 整月写入会盖掉页面上未暂存的修改，先让科长自己暂存或放弃
+  if (pendingCount.value > 0) {
+    ElMessageBox.alert(`有 ${pendingCount.value} 处修改未暂存，请先暂存或放弃修改`, '提示').catch(() => {})
+    return
+  }
   const target = viewYm()
   if (!target) return
   monthLocked.value = true
@@ -278,8 +356,6 @@ const publish = () =>
   )
 
 const editorVisible = ref(false)
-const saving = ref(false)
-const editYm = ref('')
 const editRow = ref(null)
 const editDate = ref('')
 const pick = ref(DEFAULT_PICK)
@@ -292,52 +368,59 @@ const editorTitle = computed(() => {
 })
 
 const openEditor = (row, date) => {
-  // 保存没落地前不让再开一格：否则上一条的响应会写进这一格，还会把新弹窗关掉
+  // 暂存请求还没落地前不让再开一格：重载完成会把这一格的待暂存值一起换掉，弹窗里的内容会对不上
   if (!auth.isAdmin || saving.value || monthLocked.value) return
-  const cell = cellOf(row, date)
-  editYm.value = viewYm()
+  const cell = viewCell(row, date)
   editRow.value = row
   editDate.value = date
+  // 未暂存的修改优先于后端值，重开弹窗时预选的就是科长自己刚改上去的那个值；
   // 没排过班（整月还没生成过）时没有当前值，落在「恢复规则默认」上
-  pick.value = cell?.shiftCode || DEFAULT_PICK
+  pick.value = cell?.shiftCode ?? DEFAULT_PICK
   remark.value = cell?.remark || ''
   editorVisible.value = true
 }
 
-const saveEntry = async () => {
-  if (saving.value) return
-  // 发请求前把这条记录的身份与表单值全部定死：响应回来时科长可能已经关掉弹窗、翻到别的月份
-  const target = {
-    ym: editYm.value,
-    staffId: editRow.value?.staffId,
-    workDate: editDate.value,
-    shiftCode: pick.value === DEFAULT_PICK ? null : pick.value,
-    remark: remark.value.trim() || null
+// 【确定】只写页面：不发请求，同一格再改一次就是覆盖
+const confirmPick = () => {
+  const staffId = editRow.value?.staffId
+  const workDate = editDate.value
+  if (!staffId || !workDate) return
+  pendingCells.value = {
+    ...pendingCells.value,
+    [cellKey(staffId, workDate)]: {
+      staffId,
+      workDate,
+      shiftCode: pick.value === DEFAULT_PICK ? null : pick.value,
+      remark: remark.value.trim() || null
+    }
   }
-  if (!target.ym || !target.staffId) return
+  editorVisible.value = false
+}
+
+const dropPending = async () => {
+  const n = pendingCount.value
+  if (n === 0) return
+  const ok = await confirmBox(`确认放弃这 ${n} 处未暂存的修改？放弃后这些修改不会存进草稿。`, '放弃修改')
+  if (!ok) return
+  clearPending()
+  ElMessage.info(`已放弃 ${n} 处修改`)
+}
+
+// 一次性把页面上的修改存回草稿；成功后才清空，失败时全留着让科长重试
+const saveDraftNow = async () => {
+  if (saving.value) return
+  const target = viewYm()
+  const entries = Object.values(pendingCells.value)
+  if (!target || entries.length === 0) return
   saving.value = true
   try {
-    const cell = await updateEntry(target.ym, {
-      staffId: target.staffId,
-      workDate: target.workDate,
-      shiftCode: target.shiftCode,
-      remark: target.remark
-    })
-    // 屏幕已经翻到别的月份：这份 CellVO 属于过去的视图，一格一格都不许写进当前表，
-    // 更不能把新月错误标成「草稿 · 未发布」
-    if (viewYm() !== target.ym) return
-    const row = rows.value.find((r) => r.staffId === target.staffId)
-    // 只换这一格：整表重载会把科长的滚动位置甩回左上角
-    if (row) row.cells = { ...(row.cells || {}), [target.workDate]: cell }
-    // 任何写入都让草稿回到未发布状态，后端与前端口径一致
-    if (data.value) data.value.status = 'DRAFT'
-    ElMessage.success('已保存')
-    // 弹窗已经换成别的格子（或已被科长自己关掉），别替它关
-    if (editYm.value === target.ym && editRow.value?.staffId === target.staffId && editDate.value === target.workDate) {
-      editorVisible.value = false
-    }
+    await saveDraft(target, { entries, dutyPhones: [] })
+    clearPending()
+    ElMessage.success(`已暂存 ${entries.length} 处修改`)
+    // 只在还停在这一个月时刷新视图；换月了就把屏幕留给那边的请求
+    if (viewYm() === target && ym.value === target) await reload(target)
   } catch {
-    // 失败提示由 http 拦截器统一弹出（如 1502 班次已停用），弹窗留着改
+    // 失败提示由 http 拦截器统一弹出（如 1503 日期不在本月）；pendingCells 原样保留
   } finally {
     saving.value = false
   }
@@ -392,6 +475,8 @@ table.grid tr.cov .name { background: #f9fafb; }
 /* 科长的格子可以点， hover 描边提示这里能改（成员的 td 不加这个 class） */
 table.grid td.cell { cursor: pointer; }
 table.grid td.cell:hover { outline: 2px solid #1677c8; outline-offset: -2px; }
+/* 未暂存的格子：橙色虚线框，与已落库的格子区分（与 hover 同位，后写者胜） */
+table.grid td.pending { outline: 2px dashed #f59e0b; outline-offset: -2px; }
 
 .chip {
   display: inline-block;
@@ -404,6 +489,8 @@ table.grid td.cell:hover { outline: 2px solid #1677c8; outline-offset: -2px; }
 }
 /* 手工调整过的格子：橙色底线，与规则生成的默认值区分 */
 .chip.manual { border-bottom: 3px solid #f59e0b; }
+/* 待暂存的「恢复规则默认」：还没有落库，只能以灰字提示规则值 */
+.chip.plain { background: #f3f4f6; color: #6b7280; font-weight: 400; }
 
 .foot { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
 .foot .sp { flex: 1; }
