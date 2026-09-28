@@ -35,8 +35,8 @@
 
     <!-- 规则说明只给科长看，成员不需要关心默认规则怎么来的 -->
     <div v-if="auth.isAdmin" class="info">
-      <b>排班规则：</b>工作日（周一至周五）默认<b>白班</b>，双休日与节假日默认<b>休息</b>；“调休上班”日按工作日处理。
-      夜班 / 值班 / 备班 / 请假在此基础上<b>手工调整</b>（手工改过的格子下方显示橙色线）。
+      <b>排班规则：</b>按所选<b>排班周期</b>模板生成（在“基础设置 / 排班周期”维护），法定节假日休息，调休上班日白班；
+      夜班 / 值班 / 备班 / 请假在此基础上<b>手工调整</b>（手工改过的格子下方显示橙色线）；值班电话负责人当周整格标亮。
     </div>
 
     <!-- 值班电话按周指定负责人（设计 §8.1 第 3 条）：跨月那一周的周一落在上个月，
@@ -155,6 +155,19 @@
       <el-button type="primary" :disabled="saving || loading" @click="confirmPick">确定</el-button>
     </template>
   </el-dialog>
+
+  <!-- 按规则生成先选周期模板（设计 §8.5“按模板生成”）：模板决定周一至周日各排什么班 -->
+  <el-dialog v-model="generateVisible" title="按规则生成" width="460px">
+    <el-select v-model="genTemplateId" class="gen-sel" placeholder="内置规则（工作日白班、周末休息）">
+      <el-option v-for="t in templates" :key="t.id" :label="templateLabel(t)" :value="t.id" />
+    </el-select>
+    <div v-if="templates.length === 0" class="gen-tip">没有可用模板，将按内置规则（工作日白班、周末休息）生成</div>
+    <div class="gen-tip">手工调整过的格子不会被覆盖；法定节假日为休息，调休上班日为白班</div>
+    <template #footer>
+      <el-button :disabled="working" @click="generateVisible = false">取消</el-button>
+      <el-button type="primary" :disabled="working || saving || loading" @click="confirmGenerate">生成</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
@@ -164,6 +177,7 @@ import { onBeforeRouteLeave } from 'vue-router'
 import { generateSchedule, getSchedule, publishSchedule, saveDraft } from '../api/schedules'
 import { download } from '../api/download'
 import { listShiftTypes } from '../api/shifts'
+import { listCycleTemplates } from '../api/cycles'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
@@ -179,6 +193,8 @@ const data = ref(null)
 const shifts = ref([])
 const keyword = ref('')
 const loading = ref(false)
+// 排班周期模板：只有会点【按规则生成】的科长需要，取不到时弹窗按内置规则生成
+const templates = ref([])
 // 生成与发布都会整月重写，互斥进行，按钮共用一个忙碌态
 const working = ref(false)
 // 暂存请求进行中
@@ -232,6 +248,7 @@ const reload = async (target = ym.value) => {
       dropPendingOutside(resp?.yearMonth)
       // 旧月份开着的弹窗里那一格已经不在屏幕上，一并关掉
       if (editYm.value && editYm.value !== resp?.yearMonth) editorVisible.value = false
+      if (genYm.value && genYm.value !== resp?.yearMonth) generateVisible.value = false
     }
   } catch {
     // 失败提示由 http 拦截器统一弹出；旧请求失败不动当前数据
@@ -261,6 +278,14 @@ onMounted(async () => {
   } catch {
     // 班次取不到只影响色块配色，表格仍然照常显示
   }
+  if (auth.isAdmin) {
+    // 模板取不到只少一批候选项，弹窗里照样能按内置规则生成
+    try {
+      templates.value = await listCycleTemplates()
+    } catch {
+      templates.value = []
+    }
+  }
 })
 
 onUnmounted(() => window.removeEventListener('beforeunload', beforeUnload))
@@ -284,6 +309,7 @@ const shiftMonth = async (delta) => {
   ym.value = `${date.getFullYear()}-${pad(date.getMonth() + 1)}`
   // 弹窗里那条记录属于上一个月，切月份后既没意义也存不回去
   editorVisible.value = false
+  generateVisible.value = false
   reload()
 }
 const prevMonth = () => shiftMonth(-1)
@@ -479,13 +505,56 @@ const runOnMonth = async (action, message, title, done) => {
   }
 }
 
-const generate = () =>
+// ===== 按规则生成（设计 §8.5“按模板生成”）=====
+const generateVisible = ref(false)
+// 弹窗里选中的模板 id；null = 一个模板也没有，由后端按内置规则生成
+const genTemplateId = ref(null)
+// 弹窗打开时屏幕上那个月：切月后模板选择已经不属于屏幕上这张表了
+const genYm = ref('')
+
+// 选项文字：标准周期（周一至周日：白 白 白 白 白 休 休）——班次名取首字，班次没取到就退回代号
+const templateLabel = (t) => {
+  const days = (t.days || []).map((code) => (shiftByCode.value[code]?.name || code || '').charAt(0)).join(' ')
+  return `${t.name}（周一至周日：${days}）`
+}
+
+// 默认选中本月最近一次生成用的模板；它已被删除或本月没记录时退回默认模板，一个模板也没有就是内置规则
+const initialTemplateId = () => {
+  const cur = data.value?.cycleTemplateId
+  if (cur != null && templates.value.some((t) => t.id === cur)) return cur
+  return templates.value.find((t) => t.isDefault)?.id ?? null
+}
+
+// 【按规则生成】不再直接确认，先让科长挑模板；未暂存检查仍在打开弹窗之前做
+const generate = () => {
+  if (working.value || monthLocked.value || saving.value || loading.value) return
+  if (pendingCount.value > 0) {
+    ElMessageBox.alert(`有 ${pendingCount.value} 处修改未暂存，请先暂存或放弃修改`, '提示').catch(() => {})
+    return
+  }
+  const target = viewYm()
+  if (!target) return
+  genTemplateId.value = initialTemplateId()
+  genYm.value = target
+  generateVisible.value = true
+}
+
+// 【生成】把弹窗里选的模板包进 action，互斥 / 确认 / 成功后刷新全部沿用整月写入那套逻辑
+const confirmGenerate = () => {
+  // 弹窗开着的时候屏幕换月或数据没了：这次生成不属于当前这张表，直接关掉弹窗
+  if (genYm.value !== viewYm()) {
+    generateVisible.value = false
+    return
+  }
+  const templateId = genTemplateId.value
+  generateVisible.value = false
   runOnMonth(
-    generateSchedule,
+    (target) => generateSchedule(target, templateId),
     (label) => `将按规则生成 ${label} 排班，手工调整过的格子不会被覆盖。`,
     '按规则生成',
     (resp) => `已生成 ${resp.generated} 格，跳过手工 ${resp.skippedManual} 格`
   )
+}
 
 const publish = () =>
   runOnMonth(
@@ -625,6 +694,10 @@ const saveDraftNow = async () => {
 .duty .wk { display: inline-flex; align-items: center; gap: 6px; }
 .duty .wk-no { color: #6b7280; }
 .duty .duty-sel { width: 150px; }
+
+/* 生成弹窗：模板选择撑满一行，下面两行提示分别是「没有模板」与「不会覆盖手工格」 */
+.gen-sel { width: 100%; }
+.gen-tip { margin-top: 10px; font-size: 12px; color: #6b7280; line-height: 1.6; }
 
 /* 表头与姓名列都要 sticky，border-collapse 会丢边框，所以用 separate */
 table.grid { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; }
