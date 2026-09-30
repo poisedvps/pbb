@@ -3,16 +3,19 @@ package com.hospital.pbb.staff;
 import com.hospital.pbb.common.BizException;
 import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
+import com.hospital.pbb.schedule.ScheduleService;
 import com.hospital.pbb.staff.dto.CreateStaffRequest;
 import com.hospital.pbb.staff.dto.CreateStaffResult;
 import com.hospital.pbb.staff.dto.StaffVO;
 import com.hospital.pbb.staff.dto.UpdateStaffRequest;
+import com.hospital.pbb.swap.SwapService;
 import com.hospital.pbb.user.AppUser;
 import com.hospital.pbb.user.AppUserRepository;
 import com.hospital.pbb.user.Role;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -33,12 +36,15 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** Mockito + 真实 BCrypt：临时密码必须能matches，不接受假编码器。 */
@@ -52,6 +58,8 @@ class StaffServiceTest {
     private AppUserRepository userRepo;
     private PasswordEncoder encoder;
     private OpLogService opLog;
+    private ScheduleService scheduleService;
+    private SwapService swapService;
     private StaffService service;
 
     @BeforeEach
@@ -60,6 +68,8 @@ class StaffServiceTest {
         userRepo = mock(AppUserRepository.class);
         encoder = new BCryptPasswordEncoder();
         opLog = mock(OpLogService.class);
+        scheduleService = mock(ScheduleService.class);
+        swapService = mock(SwapService.class);
 
         // 模拟数据库的自增主键，方便断言账号上的 staffId
         when(staffRepo.saveAndFlush(any(Staff.class))).thenAnswer(inv -> {
@@ -72,7 +82,7 @@ class StaffServiceTest {
         when(userRepo.saveAndFlush(any(AppUser.class))).thenAnswer(inv -> inv.getArgument(0));
         when(staffRepo.maxSortOrder()).thenReturn(0);
 
-        service = new StaffService(staffRepo, userRepo, encoder, opLog, CLOCK);
+        service = new StaffService(staffRepo, userRepo, encoder, opLog, CLOCK, scheduleService, swapService);
     }
 
     private static CreateStaffRequest request(String empNo, String name, String position, String phone,
@@ -327,5 +337,99 @@ class StaffServiceTest {
         when(staffRepo.findById(9L)).thenReturn(Optional.empty());
 
         assertEquals(1200, bizCode(() -> service.saveOrder(List.of(1L, 9L))));
+    }
+
+    private static AppUser account(long id, Long staffId, Role role) {
+        AppUser user = new AppUser();
+        user.setId(id);
+        user.setStaffId(staffId);
+        user.setUsername("A05");
+        user.setRole(role);
+        return user;
+    }
+
+    /** 成员：排班→调班→日志→账号→人员，最后才是「删除人员」留痕（设计 §9.4） */
+    @Test
+    void deletePurgesInOrderAndLogsLast() {
+        Staff s = staff(5L, "A05", "王五", 5, true);
+        AppUser user = account(9L, 5L, Role.MEMBER);
+        when(staffRepo.findById(5L)).thenReturn(Optional.of(s));
+        when(userRepo.findByStaffId(5L)).thenReturn(Optional.of(user));
+        when(staffRepo.countByName("王五")).thenReturn(1L);
+
+        service.delete(5L);
+
+        InOrder order = inOrder(scheduleService, swapService, opLog, userRepo, staffRepo);
+        order.verify(scheduleService).purgeStaff(5L, 9L);
+        order.verify(swapService).purgeStaff(5L, 9L);
+        order.verify(opLog).purgeStaff(9L, "A05", "王五", true);
+        order.verify(userRepo).delete(user);
+        order.verify(staffRepo).delete(s);
+        order.verify(opLog).record(OpAction.DELETE_STAFF, "A05", null);
+        order.verifyNoMoreInteractions();
+    }
+
+    /** 重名：按姓名的两条日志规则要跳过，否则误删别人的排班日志 */
+    @Test
+    void deleteWithDuplicateNameSkipsByNameLogPurge() {
+        Staff s = staff(5L, "A05", "王五", 5, true);
+        AppUser user = account(9L, 5L, Role.MEMBER);
+        when(staffRepo.findById(5L)).thenReturn(Optional.of(s));
+        when(userRepo.findByStaffId(5L)).thenReturn(Optional.of(user));
+        when(staffRepo.countByName("王五")).thenReturn(2L);
+
+        service.delete(5L);
+
+        verify(opLog).purgeStaff(9L, "A05", "王五", false);
+        verify(staffRepo).delete(s);
+    }
+
+    /** 没有账号的人员：userId 一路传 null，账号相关的删除一次都不能发生 */
+    @Test
+    void deleteStaffWithoutAccountSkipsUserDelete() {
+        Staff s = staff(5L, "A05", "王五", 5, true);
+        when(staffRepo.findById(5L)).thenReturn(Optional.of(s));
+        when(userRepo.findByStaffId(5L)).thenReturn(Optional.empty());
+        when(staffRepo.countByName("王五")).thenReturn(1L);
+
+        service.delete(5L);
+
+        InOrder order = inOrder(scheduleService, swapService, opLog, staffRepo);
+        order.verify(scheduleService).purgeStaff(5L, null);
+        order.verify(swapService).purgeStaff(5L, null);
+        order.verify(opLog).purgeStaff(null, "A05", "王五", true);
+        order.verify(staffRepo).delete(s);
+        order.verify(opLog).record(OpAction.DELETE_STAFF, "A05", null);
+        verify(userRepo, never()).delete(any(AppUser.class));
+        verify(userRepo, never()).flush();
+    }
+
+    /** 科长（ADMIN 账号）不能删，而且必须是任何清理发生之前的前置校验 */
+    @Test
+    void deleteAdminReturns1203AndPurgesNothing() {
+        Staff s = staff(5L, "A05", "王五", 5, true);
+        when(staffRepo.findById(5L)).thenReturn(Optional.of(s));
+        when(userRepo.findByStaffId(5L)).thenReturn(Optional.of(account(9L, 5L, Role.ADMIN)));
+
+        assertEquals(1203, bizCode(() -> service.delete(5L)));
+
+        verifyNoInteractions(scheduleService, swapService);
+        verify(userRepo, never()).delete(any(AppUser.class));
+        verify(staffRepo, never()).delete(any(Staff.class));
+        verify(opLog, never()).purgeStaff(any(), anyString(), anyString(), anyBoolean());
+        verify(opLog, never()).record(anyString(), anyString(), any());
+    }
+
+    /** 人员不存在：1200，不能退回到 id 去碰其他表 */
+    @Test
+    void deleteUnknownStaffReturns1200() {
+        when(staffRepo.findById(99L)).thenReturn(Optional.empty());
+
+        assertEquals(1200, bizCode(() -> service.delete(99L)));
+
+        verifyNoInteractions(scheduleService, swapService);
+        verify(userRepo, never()).delete(any(AppUser.class));
+        verify(staffRepo, never()).delete(any(Staff.class));
+        verify(opLog, never()).record(anyString(), anyString(), any());
     }
 }

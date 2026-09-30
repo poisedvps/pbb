@@ -7,6 +7,7 @@ import com.hospital.pbb.staff.dto.StaffVO;
 import com.hospital.pbb.staff.dto.UpdateStaffRequest;
 import jakarta.validation.Valid;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -49,6 +50,13 @@ public class StaffController {
     @PutMapping("/order")
     public ApiResponse<Void> saveOrder(@RequestBody List<Long> ids) {
         staffService.saveOrder(ids);
+        return ApiResponse.ok(null);
+    }
+
+    /** 硬删除人员及其排班、调班、日志；科长（1203）删不了 */
+    @DeleteMapping("/{id}")
+    public ApiResponse<Void> delete(@PathVariable Long id) {
+        staffService.delete(id);
         return ApiResponse.ok(null);
     }
 }
