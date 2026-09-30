@@ -6,6 +6,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -14,8 +15,12 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class OpLogServiceTest {
 
@@ -138,5 +143,62 @@ class OpLogServiceTest {
         service.recordAs(1L, "admin", OpAction.LOGIN, "admin", null);
 
         assertNull(captured().getIp());
+    }
+
+    private void stubEachDeleteReturnsOne() {
+        when(repository.deleteByUserId(7L)).thenReturn(1);
+        when(repository.deleteByTarget("A01")).thenReturn(1);
+        when(repository.deleteByActionAndTargetLike(OpAction.UPDATE_SCHEDULE, "张三 %")).thenReturn(1);
+        when(repository.deleteByActionAndDetail(OpAction.SET_DUTY_PHONE, "张三")).thenReturn(1);
+    }
+
+    @Test
+    void purgeStaffDeletesAllFourKindsInOrder() {
+        stubEachDeleteReturnsOne();
+
+        assertEquals(4, service.purgeStaff(7L, "A01", "张三", true));
+
+        InOrder inOrder = inOrder(repository);
+        inOrder.verify(repository).deleteByUserId(7L);
+        inOrder.verify(repository).deleteByTarget("A01");
+        inOrder.verify(repository).deleteByActionAndTargetLike("修改排班", "张三 %");
+        inOrder.verify(repository).deleteByActionAndDetail("设置值班电话", "张三");
+        inOrder.verifyNoMoreInteractions();
+    }
+
+    @Test
+    void purgeStaffSkipsUserIdRuleWhenUserIdIsNull() {
+        stubEachDeleteReturnsOne();
+
+        assertEquals(3, service.purgeStaff(null, "A01", "张三", true));
+
+        verify(repository, never()).deleteByUserId(any());
+        verify(repository).deleteByTarget("A01");
+        verify(repository).deleteByActionAndTargetLike("修改排班", "张三 %");
+        verify(repository).deleteByActionAndDetail("设置值班电话", "张三");
+    }
+
+    @Test
+    void purgeStaffSkipsNameRulesWhenByNameIsFalse() {
+        stubEachDeleteReturnsOne();
+
+        assertEquals(2, service.purgeStaff(7L, "A01", "张三", false));
+
+        verify(repository).deleteByUserId(7L);
+        verify(repository).deleteByTarget("A01");
+        verify(repository, never()).deleteByActionAndTargetLike(any(), any());
+        verify(repository, never()).deleteByActionAndDetail(any(), any());
+    }
+
+    @Test
+    void purgeStaffSkipsNameRulesWhenNameContainsWildcard() {
+        stubEachDeleteReturnsOne();
+
+        assertEquals(2, service.purgeStaff(7L, "A01", "张_三", true));
+
+        verify(repository).deleteByUserId(7L);
+        verify(repository).deleteByTarget("A01");
+        verify(repository, never()).deleteByActionAndTargetLike(any(), any());
+        verify(repository, never()).deleteByActionAndDetail(any(), any());
     }
 }

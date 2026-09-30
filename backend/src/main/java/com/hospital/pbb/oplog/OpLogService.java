@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
@@ -49,6 +50,28 @@ public class OpLogService {
         log.setDetail(truncate(detail, DETAIL_MAX));
         log.setIp(currentIp());
         repository.save(log);
+    }
+
+    /**
+     * 删除人员时清理与此人相关的日志（设计 §9.4），返回删除条数。
+     *
+     * <p>userId 为 null 时跳过第 1 条规则；byName=false 或姓名含 % / _ 时跳过按姓名的两条规则。</p>
+     *
+     * <p>本方法自己不再记日志；调用方（M5-07）在清理完成之后再记「删除人员」。</p>
+     */
+    @Transactional
+    public int purgeStaff(Long userId, String empNo, String name, boolean byName) {
+        int total = 0;
+        if (userId != null) {
+            total += repository.deleteByUserId(userId);
+        }
+        total += repository.deleteByTarget(empNo);
+        // 姓名在册不唯一、或含 like 通配符时，按姓名的两条规则会误删别人的日志，直接跳过
+        if (byName && name != null && !name.contains("%") && !name.contains("_")) {
+            total += repository.deleteByActionAndTargetLike(OpAction.UPDATE_SCHEDULE, name + " %");
+            total += repository.deleteByActionAndDetail(OpAction.SET_DUTY_PHONE, name);
+        }
+        return total;
     }
 
     /** 反向代理下取 X-Forwarded-For 的第一个地址，否则取连接的远端地址；不在请求上下文里时为 null */
