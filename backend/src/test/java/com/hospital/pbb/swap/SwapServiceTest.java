@@ -1135,4 +1135,47 @@ class SwapServiceTest {
         verifyNoTransition();
         verifyNoInteractions(schedule);
     }
+
+    // ---------- 删除人员数据清理（M5-03） ----------
+
+    /**
+     * 删除用的 service：仓库与人员表沿用 setUp 的桩，{@link ScheduleService} 与
+     * {@link OpLogService} 各给一个 mock，只用来校验清理时一个都不碰。
+     */
+    private SwapService purgeService() {
+        opLog = mock(OpLogService.class);
+        schedule = mock(ScheduleService.class);
+        return new SwapService(repo, staffRepo, query, schedule, opLog, em,
+                Clock.fixed(Instant.parse("2026-10-08T01:00:00Z"), ZoneOffset.UTC));
+    }
+
+    /** 人员和账号一起删：先删此人发起或作为对方的申请，再把审批人里的该账号置空。 */
+    @Test
+    void purgeStaffDeletesRequestsAndClearsReviewer() {
+        SwapService purge = purgeService();
+        when(repo.deleteByStaff(5L)).thenReturn(3);
+        when(repo.clearReviewedBy(9L)).thenReturn(2);
+
+        purge.purgeStaff(5L, 9L);
+
+        verify(repo, times(1)).deleteByStaff(5L);
+        verify(repo, times(1)).clearReviewedBy(9L);
+        // 删除人员的留痕由调用方负责，这里不记日志、不动排班
+        verifyNoInteractions(opLog);
+        verifyNoInteractions(schedule);
+    }
+
+    /** 只删人员不删账号：申请照删，审批人字段一个字都不改。 */
+    @Test
+    void purgeStaffWithoutUserIdSkipsReviewerCleanup() {
+        SwapService purge = purgeService();
+        when(repo.deleteByStaff(5L)).thenReturn(1);
+
+        purge.purgeStaff(5L, null);
+
+        verify(repo, times(1)).deleteByStaff(5L);
+        verify(repo, never()).clearReviewedBy(any());
+        verifyNoInteractions(opLog);
+        verifyNoInteractions(schedule);
+    }
 }
