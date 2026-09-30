@@ -83,7 +83,6 @@
           <tr v-for="row in visibleRows" :key="row.staffId">
             <td class="name">
               {{ row.name }}
-              <small>{{ row.empNo }}</small>
             </td>
             <!-- 只有科长能改格子，成员挂了同一个 onClick 也在 openEditor 里被挡回去；
                  切月请求在途时屏幕上还是旧月那份数据，不开格子 -->

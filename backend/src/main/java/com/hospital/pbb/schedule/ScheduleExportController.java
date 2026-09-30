@@ -56,8 +56,7 @@ public class ScheduleExportController {
         MonthScheduleVO month = query.getMonth(yearMonth, me.role() == Role.ADMIN);
         Map<String, String> shiftNames = shiftNames();
 
-        List<String> headers = new ArrayList<>(month.days().size() + 2);
-        headers.add("工号");
+        List<String> headers = new ArrayList<>(month.days().size() + 1);
         headers.add("姓名");
         for (DayVO day : month.days()) {
             headers.add(dayHeader(day));
@@ -66,7 +65,6 @@ public class ScheduleExportController {
         List<List<Object>> rows = new ArrayList<>(month.rows().size());
         for (StaffRowVO staff : month.rows()) {
             List<Object> row = new ArrayList<>(headers.size());
-            row.add(staff.empNo());
             row.add(staff.name());
             for (DayVO day : month.days()) {
                 row.add(shiftNameOf(staff, day, shiftNames));
