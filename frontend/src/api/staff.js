@@ -5,3 +5,4 @@ export const listStaff = (includeInactive = false) => http.get('/staff', { param
 export const createStaff = (data) => http.post('/staff', data) // → { staff, username, tempPassword }
 export const updateStaff = (id, data) => http.put(`/staff/${id}`, data)
 export const saveStaffOrder = (ids) => http.put('/staff/order', ids)
+export const deleteStaff = (id) => http.delete(`/staff/${id}`)
