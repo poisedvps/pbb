@@ -1,11 +1,13 @@
 package com.hospital.pbb.staff;
 
 import com.hospital.pbb.common.ApiResponse;
+import com.hospital.pbb.common.ExcelWriter;
 import com.hospital.pbb.staff.dto.CreateStaffRequest;
 import com.hospital.pbb.staff.dto.CreateStaffResult;
 import com.hospital.pbb.staff.dto.StaffVO;
 import com.hospital.pbb.staff.dto.UpdateStaffRequest;
 import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -51,6 +53,17 @@ public class StaffController {
     public ApiResponse<Void> saveOrder(@RequestBody List<Long> ids) {
         staffService.saveOrder(ids);
         return ApiResponse.ok(null);
+    }
+
+    /**
+     * 导出人员名单 xlsx（设计 §9.1 第 3 条），文件格式同时是批量导入的模板。
+     *
+     * <p>字面量路径优先于 {@code /{id}}，与排序接口同理，不会被其他映射吃掉。</p>
+     */
+    @GetMapping("/export")
+    public ResponseEntity<byte[]> export() {
+        return ExcelWriter.response(ExcelWriter.write("人员名单", StaffImportParser.HEADERS, staffService.exportRows()),
+                "人员名单.xlsx");
     }
 
     /** 硬删除人员及其排班、调班、日志；科长（1203）删不了 */
