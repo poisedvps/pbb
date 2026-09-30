@@ -7,6 +7,7 @@ import { createRouter, createMemoryHistory, RouterView } from 'vue-router'
 import { h, defineComponent } from 'vue'
 import ScheduleView from '../src/views/ScheduleView.vue'
 import { saveDraft, getSchedule, publishSchedule, generateSchedule } from '../src/api/schedules'
+import { saveStaffOrder } from '../src/api/staff'
 import { useAuthStore } from '../src/stores/auth'
 
 vi.mock('element-plus', async (importOriginal) => {
@@ -35,6 +36,8 @@ vi.mock('../src/api/shifts', () => ({
   )
 }))
 vi.mock('../src/api/download', () => ({ download: vi.fn() }))
+// M5-11 拖动排序走的是人员管理那个接口（PUT /api/staff/order）
+vi.mock('../src/api/staff', () => ({ saveStaffOrder: vi.fn(() => Promise.resolve()) }))
 
 const { ElMessageBox, ElMessage } = await import('element-plus')
 
@@ -823,5 +826,98 @@ describe('M5-08 暂存按钮常驻可点', () => {
     expect(wrapper.text()).toContain('张三') // 表已加载
     expect(btnByText('暂存（0）')).toBeFalsy()
     expect(saveDraft).not.toHaveBeenCalled()
+  })
+})
+
+// ============================================================================
+// M5-11 拖动姓名调整人员顺序（需求 §9.1 第 7 条，复用 PUT /api/staff/order）
+// ============================================================================
+describe('M5-11 拖动调整人员顺序', () => {
+  // 人员行（底部「在岗」汇总行不算）的姓名列，下标 = 行号
+  const nameTds = (wrapper) => wrapper.findAll('tbody tr:not(.cov) td.name')
+  const shownNames = () => nameTds(last).map((td) => td.text().trim())
+  const typeKeyword = async (value) => {
+    const input = document.querySelector('.kw input')
+    input.value = value
+    input.dispatchEvent(new Event('input'))
+    await flushPromises()
+  }
+  // 从第 from 行拖到第 to 行：drop 前照例先 dragover 一次（真实浏览器必经这一步）
+  const dragRow = async (wrapper, from, to) => {
+    const tds = nameTds(wrapper)
+    await tds[from].trigger('dragstart')
+    await tds[to].trigger('dragover')
+    await tds[to].trigger('drop')
+    await flushPromises()
+  }
+
+  beforeEach(() => {
+    saveStaffOrder.mockReset().mockResolvedValue(undefined)
+    ElMessage.success.mockClear()
+  })
+
+  it('把「李四」拖到「张三」上：按新顺序 [2,1] 调一次接口，表体第一行变成李四', async () => {
+    const { wrapper } = await mountView2()
+    expect(shownNames()).toEqual(['张三', '李四'])
+    // 科长才有的拖动态：光标 move + draggable=true
+    expect(nameTds(wrapper)[0].classes()).toContain('drag')
+    expect(nameTds(wrapper)[0].attributes('draggable')).toBe('true')
+
+    await dragRow(wrapper, 1, 0)
+    expect(saveStaffOrder).toHaveBeenCalledTimes(1)
+    expect(saveStaffOrder).toHaveBeenCalledWith([2, 1])
+    expect(shownNames()).toEqual(['李四', '张三'])
+    expect(ElMessage.success).toHaveBeenCalledWith('已调整人员顺序')
+    expect(getSchedule).toHaveBeenCalledTimes(1) // 成功不再刷新，顺序以页面为准
+  })
+
+  it('接口失败：重新拉本月数据，顺序退回后端那份', async () => {
+    const { wrapper } = await mountView2()
+    saveStaffOrder.mockRejectedValueOnce(new Error('403'))
+    const before = getSchedule.mock.calls.length
+    await dragRow(wrapper, 1, 0)
+    expect(saveStaffOrder).toHaveBeenCalledTimes(1)
+    expect(getSchedule).toHaveBeenCalledTimes(before + 1)
+    expect(shownNames()).toEqual(['张三', '李四']) // 重新加载后回到原顺序
+    expect(ElMessage.success).not.toHaveBeenCalled()
+  })
+
+  it('搜索框有内容时不能拖：表是被过滤过的，顺序写回去会丢掉没显示的人', async () => {
+    const { wrapper } = await mountView2()
+    await typeKeyword('A0') // 工号 A01 / A02 都命中，两行仍都在表上
+    expect(shownNames()).toEqual(['张三', '李四'])
+    expect(nameTds(wrapper)[0].classes()).not.toContain('drag')
+    expect(nameTds(wrapper)[0].attributes('draggable')).not.toBe('true')
+    await dragRow(wrapper, 1, 0)
+    expect(saveStaffOrder).not.toHaveBeenCalled()
+    expect(shownNames()).toEqual(['张三', '李四'])
+  })
+
+  it('成员登录：姓名列不可拖', async () => {
+    const { wrapper } = await mountView2({ admin: false })
+    expect(wrapper.text()).toContain('张三') // 表已加载
+    for (const td of nameTds(wrapper)) {
+      expect(td.attributes('draggable')).not.toBe('true')
+      expect(td.classes()).not.toContain('drag')
+    }
+    await dragRow(wrapper, 1, 0)
+    expect(saveStaffOrder).not.toHaveBeenCalled()
+  })
+
+  it('有 1 处未暂存修改时拖放：排序照常生效，暂存（1）仍在', async () => {
+    const { wrapper } = await mountView2()
+    await click(cellTds(wrapper)[0]) // 张三 9-01 改一格
+    await click(btnByText('确定'))
+    expect(btnByText('暂存（1）')).toBeTruthy()
+
+    await dragRow(wrapper, 1, 0)
+    expect(saveStaffOrder).toHaveBeenCalledWith([2, 1])
+    expect(shownNames()).toEqual(['李四', '张三'])
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    // 待暂存以 staffId 为键：虚线格跟着张三一起换到第二行，没有算成李四的修改
+    expect(pendingTds(wrapper)).toHaveLength(1)
+    expect(wrapper.findAll('tbody tr:not(.cov)')[1].findAll('td.pending')).toHaveLength(1)
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][1].entries).toEqual([{ staffId: 1, workDate: '2026-09-01', shiftCode: 'D', remark: null }])
   })
 })
