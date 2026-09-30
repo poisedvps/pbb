@@ -779,3 +779,21 @@ describe('M4-15 值班电话', () => {
     expect(dutySelects(wrapper)[0].props('disabled')).toBe(true)
   })
 })
+
+// ============================================================================
+// M5-06 姓名下方不再显示工号，搜索仍可按工号（需求 §9.1 第 6 条）
+// ============================================================================
+describe('M5-06 隐藏工号', () => {
+  it('姓名列不显示工号，但搜索工号仍能找到', async () => {
+    await mountView2()
+    expect(document.querySelector('tbody td.name').textContent.trim()).toBe('张三')
+    const input = document.querySelector('.kw input')
+    input.value = 'A02'
+    input.dispatchEvent(new Event('input'))
+    await flushPromises()
+    // 底部的「在岗」汇总行不是人员行（它按整列统计，不受搜索影响），只比人员行
+    expect([...document.querySelectorAll('tbody tr:not(.cov) td.name')].map((td) => td.textContent.trim())).toEqual([
+      '李四'
+    ])
+  })
+})
