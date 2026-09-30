@@ -71,6 +71,30 @@ public class StaffService {
         return result;
     }
 
+    /**
+     * 人员名单导出（设计 §9.1 第 3 条）：在职人员按排序号，每行 6 列，顺序同 {@link StaffImportParser#HEADERS}。
+     *
+     * <p>导出文件同时就是批量导入的模板（M5-12），所以空值统一写空串而不是 {@code null}，
+     * 「是 / 否」「科长 / 成员」也按导入那边能原样读回的文本来写。</p>
+     *
+     * <p>留痕的 detail 只有人数，手机号一个都不写。</p>
+     */
+    public List<List<Object>> exportRows() {
+        List<Staff> staffList = staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc();
+        List<List<Object>> rows = new ArrayList<>(staffList.size());
+        for (Staff staff : staffList) {
+            rows.add(List.of(
+                    staff.getEmpNo(),
+                    staff.getName(),
+                    nullToEmpty(staff.getPosition()),
+                    nullToEmpty(staff.getPhone()),
+                    staff.isSchedulable() ? "是" : "否",
+                    roleToText(roleOf(staff.getId()))));
+        }
+        opLog.record(OpAction.EXPORT_STAFF, "人员名单", rows.size() + "人");
+        return rows;
+    }
+
     /** 新增人员 + 创建登录账号，返回随机生成的临时密码（仅此一次可见） */
     @Transactional
     public CreateStaffResult create(CreateStaffRequest req) {
@@ -237,6 +261,19 @@ public class StaffService {
     private static StaffVO toVO(Staff s, Role role) {
         return new StaffVO(s.getId(), s.getEmpNo(), s.getName(), s.getPosition(), s.getPhone(),
                 s.isSchedulable(), s.getSortOrder(), s.isActive(), role);
+    }
+
+    /** 导出格子里写空串而不是 null：与导入模板一致，空列就是空字符串，导入时读回也是空串 */
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
+    /** 导入模板里「角色」列的写法：没有账号就是空串，导入时按「不填角色」处理 */
+    private static String roleToText(Role role) {
+        if (role == Role.ADMIN) {
+            return "科长";
+        }
+        return role == Role.MEMBER ? "成员" : "";
     }
 
     /** 前端清空输入框传的是空串，一律存 null，避免列表里出现空白字符串 */

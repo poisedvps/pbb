@@ -266,6 +266,53 @@ class StaffServiceTest {
         assertNull(all.get(1).role());
     }
 
+    /** 导出：每行 6 列、顺序同 StaffImportParser.HEADERS，岗位和电话为 null 时写空串，角色写中文 */
+    @Test
+    void exportRowsWritesSixColumnsInHeaderOrder() {
+        Staff a = staff(1L, "A01", "张三", 1, true);
+        a.setPosition("医生");
+        a.setPhone("13800000000");
+        a.setSchedulable(true);
+        Staff b = staff(2L, "A02", "李四", 2, true);
+        b.setSchedulable(false);
+        when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc()).thenReturn(List.of(a, b));
+        when(userRepo.findByStaffId(1L)).thenReturn(Optional.of(account(11L, 1L, Role.ADMIN)));
+        when(userRepo.findByStaffId(2L)).thenReturn(Optional.of(account(12L, 2L, Role.MEMBER)));
+
+        List<List<Object>> rows = service.exportRows();
+
+        assertEquals(2, rows.size());
+        assertEquals(List.of("A01", "张三", "医生", "13800000000", "是", "科长"), rows.get(0));
+        assertEquals(List.of("A02", "李四", "", "", "否", "成员"), rows.get(1));
+        // detail 只有人数，手机号不得进操作日志
+        verify(opLog).record(OpAction.EXPORT_STAFF, "人员名单", "2人");
+    }
+
+    /** 没有人可导也要留痕，detail 写 0人 */
+    @Test
+    void exportRowsWithNoActiveStaffReturnsEmptyListAndLogsZero() {
+        when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc()).thenReturn(List.of());
+
+        List<List<Object>> rows = service.exportRows();
+
+        assertTrue(rows.isEmpty());
+        verify(opLog).record(OpAction.EXPORT_STAFF, "人员名单", "0人");
+    }
+
+    /** 没有账号的人员：角色列给空串，导入时按「不填角色」处理 */
+    @Test
+    void exportRowsWithoutAccountWritesEmptyRole() {
+        Staff a = staff(1L, "A01", "张三", 1, true);
+        a.setSchedulable(true);
+        when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc()).thenReturn(List.of(a));
+        when(userRepo.findByStaffId(1L)).thenReturn(Optional.empty());
+
+        List<List<Object>> rows = service.exportRows();
+
+        assertEquals(List.of("A01", "张三", "", "", "是", ""), rows.get(0));
+        verify(opLog).record(OpAction.EXPORT_STAFF, "人员名单", "1人");
+    }
+
     @Test
     void updateDisabledStaffDisablesAccountAndSyncsName() {
         Staff s = staff(1L, "IT001", "张三", 3, true);
