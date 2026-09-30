@@ -4,6 +4,7 @@ import com.hospital.pbb.common.ApiResponse;
 import com.hospital.pbb.common.ExcelWriter;
 import com.hospital.pbb.staff.dto.CreateStaffRequest;
 import com.hospital.pbb.staff.dto.CreateStaffResult;
+import com.hospital.pbb.staff.dto.StaffImportResult;
 import com.hospital.pbb.staff.dto.StaffVO;
 import com.hospital.pbb.staff.dto.UpdateStaffRequest;
 import jakarta.validation.Valid;
@@ -18,7 +19,10 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /** 人员管理只有科长（ADMIN）能进，临时密码只在 create 的响应里出现一次。 */
@@ -71,5 +75,25 @@ public class StaffController {
     public ApiResponse<Void> delete(@PathVariable Long id) {
         staffService.delete(id);
         return ApiResponse.ok(null);
+    }
+
+    /**
+     * 批量导入人员 xlsx（设计 §9.1 第 4 条），文件就是【批量导出】那份。
+     *
+     * <p>成功回一份「导入结果」xlsx，新人员的初始密码只在这份文件里出现一次；
+     * 失败时 {@code StaffService} 抛 1210，由 GlobalExceptionHandler 回
+     * {@code {code:1210, message}}，一行数据也不会写库。</p>
+     *
+     * <p>读文件抛的 IOException 不包，同样交给 GlobalExceptionHandler 统一回 500。</p>
+     */
+    @PostMapping("/import")
+    public ResponseEntity<byte[]> importStaff(@RequestParam("file") MultipartFile file) throws IOException {
+        StaffImportResult r = staffService.importStaff(file.getInputStream());
+        List<List<Object>> rows = new ArrayList<>();
+        for (StaffImportResult.Line l : r.lines()) {
+            rows.add(List.of(l.empNo(), l.name(), l.result(), l.tempPassword() == null ? "" : l.tempPassword()));
+        }
+        return ExcelWriter.response(ExcelWriter.write("导入结果", List.of("工号", "姓名", "结果", "初始密码"), rows),
+                "人员导入结果.xlsx");
     }
 }
