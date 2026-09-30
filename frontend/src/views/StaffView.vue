@@ -4,7 +4,11 @@
       <div class="bar">
         <el-checkbox v-model="includeInactive" @change="reload">显示已停用</el-checkbox>
         <div class="sp"></div>
+        <el-button @click="exportAll">批量导出</el-button>
+        <el-button :loading="importing" @click="pickFile">批量导入</el-button>
+        <input ref="fileInput" type="file" accept=".xlsx" style="display: none" @change="onFile" />
         <el-button type="primary" @click="openCreate">新增人员</el-button>
+        <span class="tip">导入请使用【批量导出】得到的表格格式，一次最多 500 人</span>
       </div>
     </template>
 
@@ -86,6 +90,7 @@
 import { nextTick, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listStaff, createStaff, updateStaff, saveStaffOrder, deleteStaff } from '../api/staff'
+import { download, uploadForFile } from '../api/download'
 
 const list = ref([])
 const includeInactive = ref(false)
@@ -101,6 +106,10 @@ const form = reactive({ empNo: '', name: '', position: '', phone: '', schedulabl
 
 const tempVisible = ref(false)
 const tempInfo = reactive({ username: '', tempPassword: '' })
+
+// 批量导入用的隐藏文件框：点【批量导入】只是把它唤出来
+const fileInput = ref()
+const importing = ref(false)
 
 const rules = {
   empNo: [
@@ -197,6 +206,42 @@ const submit = async () => {
   }
 }
 
+// 批量导出：后端返回 xlsx 文件流（含手机号），只有科长能导，权限由后端 403 兜底
+const exportAll = () => download('/staff/export', null, '人员名单.xlsx')
+
+const pickFile = () => fileInput.value?.click()
+
+// 批量导入：结果文件（新人员的初始密码只写在里面，只出现这一次）由 uploadForFile 直接落盘，
+// 成败以它的返回值为准；失败提示（如 1210 有任何一行不对，整批未导入）也在那边统一弹，
+// 这里只在成功时提示一次并刷新列表
+const onFile = async (e) => {
+  const file = e.target.files[0]
+  if (!file) return
+  importing.value = true
+  let ok = false
+  try {
+    ok = await uploadForFile('/staff/import', file, '人员导入结果.xlsx')
+  } catch {
+    // uploadForFile 自己已经把 HTTP 层错误转成 false，这里再兜一层，不让按钮卡在转圈
+    ok = false
+  }
+  if (ok) {
+    // 弹完窗才刷新会把列表挂在弹窗上：用户按 Esc 或点关闭时 alert 是 reject，
+    // 但导入结果已经落盘，刷新不能被这一步拦掉，所以只对弹窗自身捕获异常
+    try {
+      await ElMessageBox.alert(
+        '导入成功，结果文件已下载。其中的初始密码只出现这一次，请妥善保管并尽快发给本人。',
+        '导入完成'
+      )
+    } catch {
+      // 弹窗被取消：不重复提示，也不影响下面的刷新
+    }
+    await reload()
+  }
+  importing.value = false
+  e.target.value = '' // 清空，同一份文件改完还能再选一次
+}
+
 // 删除人员：输入本人姓名确认后真删（账号、排班、值班电话、调班、日志一并删除）
 const remove = async (row) => {
   try {
@@ -246,5 +291,6 @@ const move = async (index, offset) => {
 <style scoped>
 .bar { display: flex; align-items: center; }
 .sp { flex: 1; }
+.tip { margin-left: 12px; font-size: 12px; color: #909399; }
 .temp { margin: 6px 0; font-size: 14px; }
 </style>
