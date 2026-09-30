@@ -218,21 +218,28 @@ const onFile = async (e) => {
   const file = e.target.files[0]
   if (!file) return
   importing.value = true
+  let ok = false
   try {
-    const ok = await uploadForFile('/staff/import', file, '人员导入结果.xlsx')
-    if (ok) {
+    ok = await uploadForFile('/staff/import', file, '人员导入结果.xlsx')
+  } catch {
+    // uploadForFile 自己已经把 HTTP 层错误转成 false，这里再兜一层，不让按钮卡在转圈
+    ok = false
+  }
+  if (ok) {
+    // 弹完窗才刷新会把列表挂在弹窗上：用户按 Esc 或点关闭时 alert 是 reject，
+    // 但导入结果已经落盘，刷新不能被这一步拦掉，所以只对弹窗自身捕获异常
+    try {
       await ElMessageBox.alert(
         '导入成功，结果文件已下载。其中的初始密码只出现这一次，请妥善保管并尽快发给本人。',
         '导入完成'
       )
-      await reload()
+    } catch {
+      // 弹窗被取消：不重复提示，也不影响下面的刷新
     }
-  } catch {
-    // 弹窗被关掉等情况：导入已经完成，不重复提示
-  } finally {
-    importing.value = false
-    e.target.value = '' // 清空，同一份文件改完还能再选一次
+    await reload()
   }
+  importing.value = false
+  e.target.value = '' // 清空，同一份文件改完还能再选一次
 }
 
 // 删除人员：输入本人姓名确认后真删（账号、排班、值班电话、调班、日志一并删除）

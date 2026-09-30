@@ -217,6 +217,27 @@ describe('M5-13 批量导出 / 批量导入', () => {
     expect(loadingButtons()).toEqual([])
   })
 
+  it('上传成功后把「导入完成」弹窗关掉（alert 被 reject）：已成功导入仍要刷新一次', async () => {
+    await mountBatchView()
+    ElMessageBox.alert.mockRejectedValue(new Error('cancel')) // 按 Esc / 点关闭
+    await selectFile(new File(['x'], '人员名单.xlsx'))
+    expect(uploadForFile).toHaveBeenCalledTimes(1)
+    expect(ElMessageBox.alert).toHaveBeenCalledTimes(1)
+    expect(listStaff).toHaveBeenCalledTimes(2) // 刷新不挂在弹窗确认上
+    expect(loadingButtons()).toEqual([])
+    expect(fileInputElement().value).toBe('')
+  })
+
+  it('上传接口自己抛异常（兜底）：不提示导入完成，不刷新，按钮不卡在转圈', async () => {
+    await mountBatchView()
+    uploadForFile.mockRejectedValue(new Error('network'))
+    await selectFile(new File(['x'], '人员名单.xlsx'))
+    expect(ElMessageBox.alert).not.toHaveBeenCalled()
+    expect(listStaff).toHaveBeenCalledTimes(1)
+    expect(loadingButtons()).toEqual([])
+    expect(fileInputElement().value).toBe('')
+  })
+
   it('文件框被取消（没选到文件）：不上传、不提示、不刷新', async () => {
     await mountBatchView()
     await selectFile(null)
