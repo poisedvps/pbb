@@ -6,12 +6,16 @@ import com.hospital.pbb.oplog.OpLogService;
 import com.hospital.pbb.schedule.ScheduleService;
 import com.hospital.pbb.staff.dto.CreateStaffRequest;
 import com.hospital.pbb.staff.dto.CreateStaffResult;
+import com.hospital.pbb.staff.dto.StaffImportResult;
 import com.hospital.pbb.staff.dto.StaffVO;
 import com.hospital.pbb.staff.dto.UpdateStaffRequest;
 import com.hospital.pbb.swap.SwapService;
 import com.hospital.pbb.user.AppUser;
 import com.hospital.pbb.user.AppUserRepository;
 import com.hospital.pbb.user.Role;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -21,6 +25,10 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
@@ -478,5 +486,148 @@ class StaffServiceTest {
         verify(userRepo, never()).delete(any(AppUser.class));
         verify(staffRepo, never()).delete(any(Staff.class));
         verify(opLog, never()).record(anyString(), anyString(), any());
+    }
+
+    /** 内存里造一份导入文件（写法同 StaffImportParserTest），表头永远齐 */
+    private static InputStream importFile(String[]... dataRows) throws IOException {
+        XSSFWorkbook book = new XSSFWorkbook();
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            Sheet sheet = book.createSheet("人员名单");
+            Row header = sheet.createRow(0);
+            for (int col = 0; col < StaffImportParser.HEADERS.size(); col++) {
+                header.createCell(col).setCellValue(StaffImportParser.HEADERS.get(col));
+            }
+            int rowNo = 1;
+            for (String[] cells : dataRows) {
+                Row row = sheet.createRow(rowNo++);
+                for (int col = 0; col < cells.length; col++) {
+                    row.createCell(col).setCellValue(cells[col]);
+                }
+            }
+            book.write(out);
+            return new ByteArrayInputStream(out.toByteArray());
+        } finally {
+            book.close();
+        }
+    }
+
+    /** 一行已在册（改姓名）+ 一行新人员（角色列空）：一人更新、一人新增带临时密码 */
+    @Test
+    void importUpdatesExistingRowAndCreatesMissingRow() throws IOException {
+        Staff existing = staff(1L, "A01", "张三", 1, true);
+        AppUser existingAccount = account(11L, 1L, Role.MEMBER);
+        when(staffRepo.findByEmpNo("A01")).thenReturn(Optional.of(existing));
+        when(staffRepo.findByEmpNo("A09")).thenReturn(Optional.empty());
+        when(userRepo.existsByUsername("A09")).thenReturn(false);
+        when(userRepo.findByStaffId(1L)).thenReturn(Optional.of(existingAccount));
+
+        StaffImportResult result = service.importStaff(importFile(
+                new String[] {"A01", "张三丰", "工程师", "13800000000", "是", "成员"},
+                new String[] {"A09", "孙七", "", "", "", ""}));
+
+        assertEquals(1, result.created());
+        assertEquals(1, result.updated());
+        assertEquals(2, result.lines().size());
+
+        // 更新行走 save，不动启停状态，姓名同步到账号
+        assertEquals("张三丰", existing.getName());
+        assertTrue(existing.isActive());
+        assertEquals(NOW, existing.getUpdatedAt());
+        assertEquals("张三丰", existingAccount.getDisplayName());
+        verify(staffRepo).save(existing);
+        verify(userRepo).save(existingAccount);
+
+        // 新增行：角色列为空→成员，首次登录强制改密
+        ArgumentCaptor<AppUser> createdUser = ArgumentCaptor.forClass(AppUser.class);
+        verify(userRepo).saveAndFlush(createdUser.capture());
+        AppUser created = createdUser.getValue();
+        assertEquals("A09", created.getUsername());
+        assertEquals(Role.MEMBER, created.getRole());
+        assertTrue(created.isMustChangePassword());
+        assertTrue(created.isEnabled());
+
+        StaffImportResult.Line updatedLine = result.lines().get(0);
+        assertEquals("A01", updatedLine.empNo());
+        assertEquals("更新", updatedLine.result());
+        assertNull(updatedLine.tempPassword());
+
+        StaffImportResult.Line createdLine = result.lines().get(1);
+        assertEquals("A09", createdLine.empNo());
+        assertEquals("孙七", createdLine.name());
+        assertEquals("新增", createdLine.result());
+        assertNotNull(createdLine.tempPassword());
+        assertTrue(encoder.matches(createdLine.tempPassword(), created.getPasswordHash()));
+
+        // 逐行照旧留痕，最后才是「导入人员」汇总；detail 只有人数
+        InOrder order = inOrder(opLog);
+        order.verify(opLog).record(OpAction.UPDATE_STAFF, "A01", "张三丰");
+        order.verify(opLog).record(OpAction.CREATE_STAFF, "A09", "孙七");
+        order.verify(opLog).record(OpAction.IMPORT_STAFF, "人员导入", "新增1人，更新1人");
+        order.verifyNoMoreInteractions();
+    }
+
+    /** 工号不在人员表里但已是某个账号的用户名：整批不写，1210 带行号 */
+    @Test
+    void importRejectsEmpNoTakenByAnotherAccount() throws IOException {
+        when(staffRepo.findByEmpNo("A01")).thenReturn(Optional.of(staff(1L, "A01", "张三", 1, true)));
+        when(staffRepo.findByEmpNo("A09")).thenReturn(Optional.empty());
+        when(userRepo.existsByUsername("A09")).thenReturn(true);
+
+        BizException e = assertThrows(BizException.class, () -> service.importStaff(importFile(
+                new String[] {"A01", "张三丰", "", "", "是", "成员"},
+                new String[] {"A09", "孙七", "", "", "是", ""})));
+
+        assertEquals(1210, e.getCode());
+        assertTrue(e.getMessage().contains("第3行：工号 A09 已被其他账号占用"), e.getMessage());
+        // 一行都不能写：那行 A01 看着能更新，也不得提前落库
+        verify(staffRepo, never()).saveAndFlush(any(Staff.class));
+        verify(staffRepo, never()).save(any(Staff.class));
+        verify(userRepo, never()).save(any(AppUser.class));
+        verify(userRepo, never()).saveAndFlush(any(AppUser.class));
+        verify(opLog, never()).record(anyString(), anyString(), any());
+    }
+
+    /** 25 行姓名全空：只列前 20 条，尾部报总数 */
+    @Test
+    void importTruncatesErrorListToTwentyAndTellsTotal() throws IOException {
+        String[][] rows = new String[25][];
+        for (int i = 0; i < rows.length; i++) {
+            rows[i] = new String[] {String.format("E%02d", i + 1), "", "", "", "是", "成员"};
+        }
+
+        BizException e = assertThrows(BizException.class, () -> service.importStaff(importFile(rows)));
+
+        assertEquals(1210, e.getCode());
+        assertTrue(e.getMessage().startsWith("导入失败，没有写入任何数据："), e.getMessage());
+        assertTrue(e.getMessage().endsWith("；等共 25 处错误"), e.getMessage());
+        // 只展前 20 条：第 21 条（数据行第 21 行 = Excel 第 22 行）不得出现在文案里
+        assertTrue(e.getMessage().contains("第2行：姓名不能为空"), e.getMessage());
+        assertFalse(e.getMessage().contains("第22行"), e.getMessage());
+        verify(staffRepo, never()).save(any(Staff.class));
+        verify(staffRepo, never()).saveAndFlush(any(Staff.class));
+    }
+
+    /** 已在册的人文件里写了「科长」也不改角色：导入只负人员基本信息，不提权 */
+    @Test
+    void importKeepsRoleOfExistingStaff() throws IOException {
+        Staff existing = staff(1L, "A01", "张三", 1, true);
+        AppUser member = account(11L, 1L, Role.MEMBER);
+        member.setEnabled(true);
+        when(staffRepo.findByEmpNo("A01")).thenReturn(Optional.of(existing));
+        when(userRepo.findByStaffId(1L)).thenReturn(Optional.of(member));
+
+        StaffImportResult result = service.importStaff(importFile(
+                new String[] {"A01", "张三丰", "医生", "13800000000", "否", "科长"}));
+
+        assertEquals(0, result.created());
+        assertEquals(1, result.updated());
+        assertEquals(Role.MEMBER, member.getRole());
+        assertTrue(member.isEnabled());
+        assertFalse(existing.isSchedulable());
+        assertEquals("张三丰", existing.getName());
+        assertEquals("医生", existing.getPosition());
+        assertEquals("13800000000", existing.getPhone());
+        verify(opLog).record(OpAction.IMPORT_STAFF, "人员导入", "新增0人，更新1人");
+        verify(opLog, never()).record(eq(OpAction.CREATE_STAFF), anyString(), any());
     }
 }
