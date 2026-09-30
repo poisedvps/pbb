@@ -34,9 +34,7 @@
       <el-table-column label="操作" min-width="260">
         <template #default="{ row, $index }">
           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
-          <el-button link type="warning" @click="toggleActive(row)">
-            {{ row.active ? '停用' : '启用' }}
-          </el-button>
+          <el-button v-if="row.role !== 'ADMIN'" link type="danger" @click="remove(row)">删除</el-button>
           <el-button link :disabled="$index === 0 || savingOrder" @click="move($index, -1)">上移</el-button>
           <el-button link :disabled="$index === list.length - 1 || savingOrder" @click="move($index, 1)">下移</el-button>
         </template>
@@ -44,7 +42,7 @@
     </el-table>
   </el-card>
 
-  <!-- 新增 / 编辑共用：编辑时工号只读、无角色、多一个在职开关 -->
+  <!-- 新增 / 编辑共用：编辑时工号只读、无角色；在职与否已由【删除】取代 -->
   <el-dialog v-model="dialogVisible" :title="editing ? '编辑人员' : '新增人员'" width="460px">
     <el-form ref="formRef" :model="form" :rules="rules" label-width="90px">
       <el-form-item label="工号" prop="empNo">
@@ -68,9 +66,6 @@
           <el-option label="科长" value="ADMIN" />
         </el-select>
       </el-form-item>
-      <el-form-item v-else label="在职" prop="active">
-        <el-switch v-model="form.active" />
-      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="dialogVisible = false">取消</el-button>
@@ -89,8 +84,8 @@
 
 <script setup>
 import { nextTick, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { listStaff, createStaff, updateStaff, saveStaffOrder } from '../api/staff'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { listStaff, createStaff, updateStaff, saveStaffOrder, deleteStaff } from '../api/staff'
 
 const list = ref([])
 const includeInactive = ref(false)
@@ -202,17 +197,25 @@ const submit = async () => {
   }
 }
 
-// 停用 / 启用：只改 active，其余字段沿用当前行
-const toggleActive = async (row) => {
+// 删除人员：输入本人姓名确认后真删（账号、排班、值班电话、调班、日志一并删除）
+const remove = async (row) => {
   try {
-    await updateStaff(row.id, {
-      name: row.name,
-      position: row.position || '',
-      phone: row.phone || '',
-      schedulable: row.schedulable,
-      active: !row.active
-    })
-    ElMessage.success(row.active ? '已停用' : '已启用')
+    await ElMessageBox.prompt(
+      `删除后，${row.name} 的登录账号、全部排班（含已发布的历史月份）、值班电话、调班申请和相关操作日志将被永久删除，无法恢复。请输入该人员姓名确认：`,
+      '删除人员',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        inputValidator: (v) => v === row.name || '姓名不一致'
+      }
+    )
+  } catch {
+    return // 取消
+  }
+  try {
+    await deleteStaff(row.id)
+    ElMessage.success('已删除')
     await reload()
   } catch {
     // 失败提示由 http 拦截器统一弹出
