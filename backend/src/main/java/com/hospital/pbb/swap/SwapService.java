@@ -275,6 +275,26 @@ public class SwapService {
     }
 
     /**
+     * 删除人员时清理调班数据（任务单 M5-03，设计 §9.4）。
+     *
+     * <p>申请人或对方都被删掉了，这条申请对谁都没有意义，直接删干净，不留下半截单据。
+     * 审批人是账号而不是人员，账号被删时只把 {@code reviewedBy} 置空，单据本身留着。</p>
+     *
+     * <p>不记操作日志：删除人员这个动作由 M5-07 统一留痕，这里再记一遍只会把调用方的
+     * 删除日志冲掉，也不碰排班。</p>
+     *
+     * @param staffId 被删除的人员 id
+     * @param userId  需要同步置空审批人的账号 id，为 null 时跳过这一步
+     */
+    @Transactional
+    public void purgeStaff(Long staffId, Long userId) {
+        repo.deleteByStaff(staffId);
+        if (userId != null) {
+            repo.clearReviewedBy(userId);
+        }
+    }
+
+    /**
      * 按 id 取申请，并锁住这一行；查不到就是已经没了，1600。
      *
      * <p>{@code SELECT ... FOR UPDATE} 是这条流程的串行化点：锁只落在这一条申请、一行上（不涉排班表），
