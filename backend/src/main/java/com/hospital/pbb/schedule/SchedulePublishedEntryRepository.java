@@ -24,4 +24,9 @@ public interface SchedulePublishedEntryRepository extends JpaRepository<Schedule
     @Modifying
     @Query("delete from SchedulePublishedEntry e where e.workDate between :start and :end")
     int deleteByWorkDateRange(@Param("start") LocalDate start, @Param("end") LocalDate end);
+
+    /** 删除人员：删掉此人全部已发布排班快照，不限月份（任务单 M5-02） */
+    @Modifying
+    @Query("delete from SchedulePublishedEntry e where e.staffId = :staffId")
+    int deleteByStaffId(@Param("staffId") Long staffId);
 }

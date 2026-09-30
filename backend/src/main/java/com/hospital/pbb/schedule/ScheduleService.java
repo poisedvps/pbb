@@ -506,6 +506,38 @@ public class ScheduleService {
         opLog.record(OpAction.APPLY_SWAP_TO_SCHEDULE, target, "共" + changes.size() + "格");
     }
 
+    /**
+     * 删除人员：删此人全部草稿 / 已发布排班与值班电话（设计 §9.4，任务单 M5-02）。
+     *
+     * <p>不限月份，历史月份的已发布快照一并删掉——人都不在了，历史表里留着一行只会在大屏和
+     * “我的排班”里挂一个查不到名字的空位。调用方（M5-07）只传 id，这里不再校验人员是否存在。</p>
+     *
+     * <p>{@code userId} 是该人员登录账号的 id（没有账号时为 null）：账号要被删，外键会卡住，
+     * 所以先把 {@code schedule_entry.updated_by}、{@code duty_phone_week.updated_by}、
+     * {@code schedule_month.published_by} 里该账号留下的痕迹置空，格子本身保留。</p>
+     *
+     * <p>不记操作日志（那条“删除人员”由 staff 模块统一记，记在这里会被随后的日志清理删掉），
+     * 不取当月 advisory lock（整段和 staff 模块的其余删除跑在同一个事务里，
+     * 删的是指定 staff 的行，不碰别人的格子），
+     * 也不改 {@code schedule_month.status}：人删了不等于这一月要被打回草稿。</p>
+     *
+     * @param staffId 被删除的人员 id
+     * @param userId  该人员的登录账号 id，为 null 时跳过操作人字段清理
+     */
+    @Transactional
+    public void purgeStaff(Long staffId, Long userId) {
+        entryRepo.deleteByStaffId(staffId);
+        publishedRepo.deleteByStaffId(staffId);
+        dutyRepo.deleteByStaffId(staffId);
+        dutyPublishedRepo.deleteByStaffId(staffId);
+
+        if (userId != null) {
+            entryRepo.clearUpdatedBy(userId);
+            dutyRepo.clearUpdatedBy(userId);
+            monthRepo.clearPublishedBy(userId);
+        }
+    }
+
     /** 快照只带走会展示的那几列，{@code is_manual}、{@code updated_by} 这些管理字段留在草稿表里 */
     private static SchedulePublishedEntry newSnapshot(ScheduleEntry entry, int version) {
         SchedulePublishedEntry snapshot = new SchedulePublishedEntry();

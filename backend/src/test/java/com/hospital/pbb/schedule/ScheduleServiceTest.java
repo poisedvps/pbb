@@ -41,6 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -49,6 +50,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -1107,6 +1109,52 @@ class ScheduleServiceTest {
         verify(dutyPublishedRepo, never()).save(any());
         verify(dutyPublishedRepo, never()).saveAll(any());
         verify(dutyPublishedRepo, never()).delete(any());
+    }
+
+    // ---------- 删除人员用的排班数据清理（任务单 M5-02） ----------
+
+    /** 用例：purgeStaff(5L, 9L) → 四张表各按 staffId 删一次，该账号留下的操作人字段各清一次，全程不记日志 */
+    @Test
+    void purgeStaffDeletesScheduleDataAndClearsOperatorFields() {
+        service.purgeStaff(5L, 9L);
+
+        verify(entryRepo, times(1)).deleteByStaffId(5L);
+        verify(publishedRepo, times(1)).deleteByStaffId(5L);
+        verify(dutyRepo, times(1)).deleteByStaffId(5L);
+        verify(dutyPublishedRepo, times(1)).deleteByStaffId(5L);
+
+        verify(entryRepo, times(1)).clearUpdatedBy(9L);
+        verify(dutyRepo, times(1)).clearUpdatedBy(9L);
+        verify(monthRepo, times(1)).clearPublishedBy(9L);
+
+        verifyNoInteractions(opLog);
+    }
+
+    /** 用例：purgeStaff(5L, null)（此人没有登录账号）→ 只删数据，操作人字段一律不动 */
+    @Test
+    void purgeStaffWithoutUserSkipsOperatorFieldCleanup() {
+        service.purgeStaff(5L, null);
+
+        verify(entryRepo, times(1)).deleteByStaffId(5L);
+        verify(publishedRepo, times(1)).deleteByStaffId(5L);
+        verify(dutyRepo, times(1)).deleteByStaffId(5L);
+        verify(dutyPublishedRepo, times(1)).deleteByStaffId(5L);
+
+        verify(entryRepo, never()).clearUpdatedBy(any());
+        verify(dutyRepo, never()).clearUpdatedBy(any());
+        verify(monthRepo, never()).clearPublishedBy(any());
+        verifyNoInteractions(opLog);
+    }
+
+    /** 清理只删行、置空操作人字段：不锁月、不改月份状态、不往任何表里写东西 */
+    @Test
+    void purgeStaffNeverLocksMonthNorWritesAnything() {
+        service.purgeStaff(5L, 9L);
+
+        verify(monthRepo, never()).lockMonth(anyInt());
+        verify(monthRepo, never()).save(any(ScheduleMonth.class));
+        verify(entryRepo, never()).save(any(ScheduleEntry.class));
+        verify(dutyRepo, never()).save(any(DutyPhoneWeek.class));
     }
 
     /** 暂存的任何一条校验失败都应当“全批不写”：格子、值班电话、月份状态、日志一处都没有变动 */
