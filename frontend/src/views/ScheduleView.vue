@@ -24,7 +24,7 @@
         v-if="auth.isAdmin"
         type="primary"
         :loading="saving"
-        :disabled="pendingCount === 0 || monthLocked || saving || loading"
+        :disabled="!data || monthLocked || saving || loading"
         @click="saveDraftNow"
       >
         暂存（{{ pendingCount }}）
@@ -120,7 +120,7 @@
         </span>
       </div>
       <div class="sp"></div>
-      <span v-if="auth.isAdmin" class="note">点击单元格修改班次，修改后点【暂存】保存；底部行 = 每日在岗人数</span>
+      <span v-if="auth.isAdmin" class="note">点击单元格修改班次，修改后点【暂存】保存；按规则生成的结果会直接存为草稿；底部行 = 每日在岗人数</span>
     </div>
   </el-card>
 
@@ -636,7 +636,12 @@ const saveDraftNow = async () => {
     weekStart,
     staffId: staffId === undefined ? null : staffId
   }))
-  if (!target || (entries.length === 0 && dutyPhones.length === 0)) return
+  if (!target) return
+  // 按钮常驻可点（需求 §9.1 第 5 条）：没有未暂存修改时只提示，不发请求
+  if (entries.length === 0 && dutyPhones.length === 0) {
+    ElMessage.info('排班表草稿已是最新，没有需要暂存的修改')
+    return
+  }
   // 兜底：一批待暂存的格子日期必须全属于要发的那个月，否则后端会整批拒（1503）。
   // 走到这里说明页面和数据对不上，宁可作废这批修改也不发跨月日期
   if (pendingYm.value !== target || entries.some((e) => !e.workDate.startsWith(target))) {

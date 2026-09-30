@@ -341,9 +341,9 @@ describe('M4-14 暂存', () => {
     ])
   })
 
-  it('按钮初始禁用；有修改后可点', async () => {
+  it('暂存按钮初始可点；放弃修改初始禁用', async () => {
     const { wrapper } = await mountView2()
-    expect(btnByText('暂存（0）').disabled).toBe(true)
+    expect(btnByText('暂存（0）').disabled).toBe(false)
     expect(btnByText('放弃修改').disabled).toBe(true)
     await click(cellTds(wrapper)[0])
     await click(btnByText('确定'))
@@ -370,7 +370,7 @@ describe('M4-14 暂存', () => {
     expect(wrapper.text()).toContain('2026年10月')
     expect(bodyTds()).toHaveLength(16) // 换成 10 月那 8 天
     expect(pendingTds(wrapper)).toHaveLength(0)
-    expect(btnByText('暂存（0）').disabled).toBe(true)
+    expect(btnByText('暂存（0）').disabled).toBe(false)
     // 在新月里正常改一格：送出的日期全属新月
     await click(cellTds(wrapper)[0])
     await click(btnByText('确定'))
@@ -393,7 +393,7 @@ describe('M4-14 暂存', () => {
     await click(btnByText('确定')) // 新月落地后再点一次，同样无效
     expect(pendingTds(wrapper)).toHaveLength(0)
     expect(saveDraft).not.toHaveBeenCalled()
-    expect(btnByText('暂存（0）').disabled).toBe(true)
+    expect(btnByText('暂存（0）').disabled).toBe(false)
   })
 
   it('切月确认后旧月那批修改整批作废，新月表上不留虚线与计数', async () => {
@@ -795,5 +795,33 @@ describe('M5-06 隐藏工号', () => {
     expect([...document.querySelectorAll('tbody tr:not(.cov) td.name')].map((td) => td.textContent.trim())).toEqual([
       '李四'
     ])
+  })
+})
+
+// ============================================================================
+// M5-08 「暂存」按钮常驻可点（需求 §9.1 第 5 条）
+// 表格加载完成后按钮就能点；没有未暂存修改时只提示，不发请求
+// ============================================================================
+describe('M5-08 暂存按钮常驻可点', () => {
+  it('没有未暂存修改时点暂存：只提示，不发 saveDraft', async () => {
+    await mountView2()
+    ElMessage.info.mockClear()
+    const btn = btnByText('暂存（0）')
+    expect(btn).toBeTruthy()
+    expect(btn.disabled).toBe(false) // 表加载完就能点
+    await click(btn)
+    expect(saveDraft).not.toHaveBeenCalled()
+    expect(ElMessage.info).toHaveBeenCalledTimes(1)
+    expect(ElMessage.info).toHaveBeenCalledWith('排班表草稿已是最新，没有需要暂存的修改')
+    expect(document.querySelector('.note').textContent.trim()).toBe(
+      '点击单元格修改班次，修改后点【暂存】保存；按规则生成的结果会直接存为草稿；底部行 = 每日在岗人数'
+    )
+  })
+
+  it('成员登录：表加载完了也仍没有暂存按钮', async () => {
+    const { wrapper } = await mountView2({ admin: false })
+    expect(wrapper.text()).toContain('张三') // 表已加载
+    expect(btnByText('暂存（0）')).toBeFalsy()
+    expect(saveDraft).not.toHaveBeenCalled()
   })
 })
