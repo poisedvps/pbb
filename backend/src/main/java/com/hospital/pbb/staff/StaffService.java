@@ -3,10 +3,12 @@ package com.hospital.pbb.staff;
 import com.hospital.pbb.common.BizException;
 import com.hospital.pbb.oplog.OpAction;
 import com.hospital.pbb.oplog.OpLogService;
+import com.hospital.pbb.schedule.ScheduleService;
 import com.hospital.pbb.staff.dto.CreateStaffRequest;
 import com.hospital.pbb.staff.dto.CreateStaffResult;
 import com.hospital.pbb.staff.dto.StaffVO;
 import com.hospital.pbb.staff.dto.UpdateStaffRequest;
+import com.hospital.pbb.swap.SwapService;
 import com.hospital.pbb.user.AppUser;
 import com.hospital.pbb.user.AppUserRepository;
 import com.hospital.pbb.user.PasswordUtil;
@@ -43,14 +45,18 @@ public class StaffService {
     private final PasswordEncoder encoder;
     private final OpLogService opLog;
     private final Clock clock;
+    private final ScheduleService scheduleService;
+    private final SwapService swapService;
 
     public StaffService(StaffRepository staffRepo, AppUserRepository userRepo, PasswordEncoder encoder,
-                        OpLogService opLog, Clock clock) {
+                        OpLogService opLog, Clock clock, ScheduleService scheduleService, SwapService swapService) {
         this.staffRepo = staffRepo;
         this.userRepo = userRepo;
         this.encoder = encoder;
         this.opLog = opLog;
         this.clock = clock;
+        this.scheduleService = scheduleService;
+        this.swapService = swapService;
     }
 
     /** 人员列表按排序号返回；includeInactive=true 时连停用人员一起返回 */
@@ -162,6 +168,43 @@ public class StaffService {
             staffRepo.save(staff);
         }
         opLog.record(OpAction.SORT_STAFF, ids.stream().map(String::valueOf).collect(Collectors.joining(",")), null);
+    }
+
+    /**
+     * 删除人员及其全部相关数据（设计 §9.4）。科长不能删（1203）。
+     *
+     * <p>顺序不能随便排：先清理排班、调班，再清日志，最后才删账号与人员——人和账号还在的时候
+     * 外键都指向得到，反过来删会先撞 {@code app_user.staff_id} / {@code schedule_entry.staff_id}。</p>
+     *
+     * <p>那条「删除人员」日志必须记在 {@link OpLogService#purgeStaff} 之后：purgeStaff 会按
+     * {@code target = 工号} 删日志，先记就被自己删掉了。</p>
+     *
+     * <p>日志里的姓名只在同名唯一时才当过滤条件用（{@code byName}），否则 {@code 姓名 %} 会误删别人的排班日志。</p>
+     */
+    @Transactional
+    public void delete(Long id) {
+        Staff staff = load(id);
+        AppUser user = userRepo.findByStaffId(id).orElse(null);
+        Long userId = user == null ? null : user.getId();
+        if (user != null && user.getRole() == Role.ADMIN) {
+            throw new BizException(1203, "科长不能删除");
+        }
+        boolean byName = staffRepo.countByName(staff.getName()) == 1;
+
+        scheduleService.purgeStaff(id, userId);
+        swapService.purgeStaff(id, userId);
+        opLog.purgeStaff(userId, staff.getEmpNo(), staff.getName(), byName);
+
+        if (user != null) {
+            // 先清账号再删人员：app_user.staff_id 是指向 staff 的外键
+            userRepo.delete(user);
+            userRepo.flush();
+        }
+        staffRepo.delete(staff);
+        staffRepo.flush();
+
+        // detail 传 null：姓名和手机号都不进操作日志
+        opLog.record(OpAction.DELETE_STAFF, staff.getEmpNo(), null);
     }
 
     /**
