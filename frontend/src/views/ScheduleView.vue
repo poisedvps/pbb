@@ -36,7 +36,7 @@
     <!-- 规则说明只给科长看，成员不需要关心默认规则怎么来的 -->
     <div v-if="auth.isAdmin" class="info">
       <b>排班规则：</b>按所选<b>排班周期</b>模板生成（在“基础设置 / 排班周期”维护），法定节假日休息，调休上班日白班；
-      夜班 / 值班 / 备班 / 请假在此基础上<b>手工调整</b>（手工改过的格子下方显示橙色线）；值班电话负责人当周整格标亮。
+      夜班 / 值班 / 备班 / 请假在此基础上<b>手工调整</b>（手工改过的格子下方显示橙色线）；值班电话负责人当周整格标亮。拖动姓名可调整人员顺序。
     </div>
 
     <!-- 值班电话按周指定负责人（设计 §8.1 第 3 条）：跨月那一周的周一落在上个月，
@@ -81,7 +81,15 @@
         </thead>
         <tbody>
           <tr v-for="row in visibleRows" :key="row.staffId">
-            <td class="name">
+            <!-- 顺序全科共用，只有科长能拖；搜索时表格是被过滤过的，拖出来的顺序不是全量，一并禁掉 -->
+            <td
+              class="name"
+              :class="{ drag: canDrag }"
+              :draggable="canDrag"
+              @dragstart="onDragStart(row)"
+              @dragover.prevent
+              @drop.prevent="onDrop(row)"
+            >
               {{ row.name }}
             </td>
             <!-- 只有科长能改格子，成员挂了同一个 onClick 也在 openEditor 里被挡回去；
@@ -175,6 +183,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { onBeforeRouteLeave } from 'vue-router'
 import { generateSchedule, getSchedule, publishSchedule, saveDraft } from '../api/schedules'
 import { download } from '../api/download'
+import { saveStaffOrder } from '../api/staff'
 import { listShiftTypes } from '../api/shifts'
 import { listCycleTemplates } from '../api/cycles'
 import { useAuthStore } from '../stores/auth'
@@ -469,6 +478,43 @@ const onDuty = computed(() => {
   return count
 })
 
+// ===== 拖动调整人员顺序（需求 §9.1 第 7 条）=====
+// 顺序是全科共用的：排班表、人员管理页、大屏、导出都读同一份 sortNo，拖一次就整份写回
+const dragStaffId = ref(null)
+// 排序请求在途时屏幕上已是新顺序、后端还是旧顺序，不能再拖第二次
+const ordering = ref(false)
+// 能改格子才能拖：切月数据在途 / 暂存中 / 整月重写中都不行（同 cellEditable），搜索过滤时也不行
+const canDrag = computed(() => cellEditable.value && keyword.value.trim() === '' && !ordering.value)
+
+const onDragStart = (row) => {
+  if (canDrag.value) dragStaffId.value = row.staffId
+}
+
+const onDrop = async (target) => {
+  const fromId = dragStaffId.value
+  dragStaffId.value = null
+  if (!canDrag.value || fromId === null || fromId === target.staffId) return
+  const list = [...rows.value]
+  const from = list.findIndex((r) => r.staffId === fromId)
+  const to = list.findIndex((r) => r.staffId === target.staffId)
+  if (from < 0 || to < 0) return
+  const [moved] = list.splice(from, 1)
+  list.splice(to, 0, moved)
+  const targetYm = viewYm()
+  // 先按新顺序渲染：待暂存的修改以 staffId 为键，顺序变了它们照样跟着各自的行
+  data.value = { ...data.value, rows: list }
+  ordering.value = true
+  try {
+    await saveStaffOrder(list.map((r) => r.staffId))
+    ElMessage.success('已调整人员顺序')
+  } catch {
+    // 失败提示由 http 拦截器统一弹出；重新拉一次，屏幕退回后端记着的那份顺序
+    await reload(targetYm)
+  } finally {
+    ordering.value = false
+  }
+}
+
 const confirmBox = (message, title) =>
   ElMessageBox.confirm(message, title, { type: 'warning', confirmButtonText: '确 定', cancelButtonText: '取 消' })
     .then(() => true)
@@ -731,6 +777,8 @@ table.grid thead th.name { z-index: 2; background: #f9fafb; }
 table.grid td { min-width: 46px; }
 table.grid tr.cov td { background: #f9fafb; font-size: 12px; height: 30px; }
 table.grid tr.cov .name { background: #f9fafb; }
+/* 科长可拖的姓名单元格：拖动改顺序，搜索时不加这个 class，光标也就不变 */
+table.grid td.name.drag { cursor: move; }
 /* 科长的格子可以点， hover 描边提示这里能改（成员的 td 不加这个 class） */
 table.grid td.cell { cursor: pointer; }
 table.grid td.cell:hover { outline: 2px solid #1677c8; outline-offset: -2px; }
