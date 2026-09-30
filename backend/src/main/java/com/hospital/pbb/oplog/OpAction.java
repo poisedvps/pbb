@@ -15,6 +15,9 @@ public final class OpAction {
     public static final String CREATE_STAFF = "新增人员";
     public static final String UPDATE_STAFF = "修改人员";
     public static final String SORT_STAFF = "调整人员排序";
+    public static final String DELETE_STAFF = "删除人员";
+    public static final String IMPORT_STAFF = "导入人员";
+    public static final String EXPORT_STAFF = "导出人员";
     public static final String UPDATE_SHIFT = "修改班次";
     public static final String CREATE_HOLIDAY = "新增节假日";
     public static final String UPDATE_HOLIDAY = "修改节假日";
