@@ -17,4 +17,9 @@ public interface DutyPhonePublishedRepository extends JpaRepository<DutyPhonePub
     @Modifying
     @Query("delete from DutyPhonePublished d where d.weekStart between :from and :to")
     int deleteByWeekStartRange(@Param("from") LocalDate from, @Param("to") LocalDate to);
+
+    /** 删除人员：删掉此人负责的全部值班电话已发布快照周，不限月份（任务单 M5-02） */
+    @Modifying
+    @Query("delete from DutyPhonePublished d where d.staffId = :staffId")
+    int deleteByStaffId(@Param("staffId") Long staffId);
 }
