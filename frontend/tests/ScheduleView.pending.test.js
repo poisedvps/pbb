@@ -158,12 +158,16 @@ const mountView2 = async (opts) => {
   return m
 }
 beforeEach(() => {
+  // 页面默认打开系统当前月，测试数据按 2026-09 准备，这里把日期固定住
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date(2026, 8, 15, 12, 0, 0))
   document.body.innerHTML = ''
 })
 afterEach(() => {
   last?.unmount()
   last = null
   document.body.innerHTML = ''
+  vi.useRealTimers()
 })
 
 describe('M4-14 暂存', () => {
