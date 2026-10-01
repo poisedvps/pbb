@@ -366,9 +366,9 @@ LAST_DAY="$(date -v1d -v+2m -v-1d +%Y-%m-%d)"
 STATS="$(api GET "/api/stats?from=${NM}-01&to=${LAST_DAY}" "$TOKEN")"
 [ "$(printf '%s' "$STATS" | jget code)" = "0" ] || fail "统计失败：$(err_of "$STATS")"
 
-# M4-e：甲值班的 ${FIRST_MON} 那一周整周都在 ${NM} 内，值班电话天数必然是 7
-DUTY_DAYS="$(printf '%s' "$STATS" | jpick data.rows staffId "$SID_A" dutyPhoneDays)"
-[ "$DUTY_DAYS" = "7" ] || fail "甲的 dutyPhoneDays 应为 7，实际 ${DUTY_DAYS:-空}"
+# M6：甲值班的 ${FIRST_MON} 那一周整周都在 ${NM} 内，值班电话周数必然是 1
+DUTY_WEEKS="$(printf '%s' "$STATS" | jpick data.rows staffId "$SID_A" dutyPhoneWeeks)"
+[ "$DUTY_WEEKS" = "1" ] || fail "甲的 dutyPhoneWeeks 应为 1，实际 ${DUTY_WEEKS:-空}"
 
 META="$(http_meta GET "/api/stats/export?from=${NM}-01&to=${LAST_DAY}" "$TOKEN")"
 [ "${META%% *}" = "200" ] || fail "统计导出 HTTP=${META%% *}"
