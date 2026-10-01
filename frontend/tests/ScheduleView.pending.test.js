@@ -921,3 +921,89 @@ describe('M5-11 拖动调整人员顺序', () => {
     expect(saveDraft.mock.calls[0][1].entries).toEqual([{ staffId: 1, workDate: '2026-09-01', shiftCode: 'D', remark: null }])
   })
 })
+
+describe('M6-02 弹窗设置值班电话', () => {
+  it('只设置值班电话：整周黄底，暂存只发送值班电话', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await click(dutyRowTds(wrapper, 0)[dayCol(8)])
+    await click(btnByText('值班电话'))
+    await click(btnByText('确定'))
+    for (let day = 5; day <= 11; day++) {
+      expect(dutyBg(dutyRowTds(wrapper, 0)[dayCol(day)])).toContain(DUTY_YELLOW)
+    }
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][1]).toEqual({
+      entries: [], dutyPhones: [{ weekStart: '2026-10-05', staffId: 1 }]
+    })
+  })
+
+  it('替换李四时提示原负责人，并更新黄底', async () => {
+    const months = {
+      '2026-10': dutyMonthOf('2026-10', { dutyPhones: [dutyRow('2026-10-05', '2026-10-11', 2, '李四')] })
+    }
+    const { wrapper } = await mountDuty({ ym: '2026-10', months })
+    await click(dutyRowTds(wrapper, 0)[dayCol(8)])
+    expect(btnByText('值班电话').classList.contains('on')).toBe(false)
+    await click(btnByText('值班电话'))
+    await click(btnByText('确定'))
+    expect(ElMessage.info).toHaveBeenCalledWith('已替换原值班电话负责人 李四')
+    expect(dutyBg(dutyRowTds(wrapper, 0)[dayCol(8)])).toContain(DUTY_YELLOW)
+    expect(dutyBg(dutyRowTds(wrapper, 1)[dayCol(8)])).not.toContain(DUTY_YELLOW)
+  })
+
+  it('取消张三的值班电话，暂存发送 null 且不写格子', async () => {
+    const months = {
+      '2026-10': dutyMonthOf('2026-10', { dutyPhones: [dutyRow('2026-10-05', '2026-10-11', 1, '张三')] })
+    }
+    const { wrapper } = await mountDuty({ ym: '2026-10', months })
+    await click(dutyRowTds(wrapper, 0)[dayCol(8)])
+    expect(btnByText('值班电话').classList.contains('on')).toBe(true)
+    await click(btnByText('值班电话'))
+    await click(btnByText('确定'))
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][1]).toEqual({
+      entries: [], dutyPhones: [{ weekStart: '2026-10-05', staffId: null }]
+    })
+  })
+
+  it('同时修改夜班和值班电话，暂存两处', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await click(dutyRowTds(wrapper, 0)[dayCol(8)])
+    await click(btnByText('夜班'))
+    await click(btnByText('值班电话'))
+    await click(btnByText('确定'))
+    expect(btnByText('暂存（2）')).toBeTruthy()
+    await click(btnByText('暂存（2）'))
+    const body = saveDraft.mock.calls[0][1]
+    expect(body.entries).toHaveLength(1)
+    expect(body.entries[0].shiftCode).toBe('N')
+    expect(body.dutyPhones).toEqual([{ weekStart: '2026-10-05', staffId: 1 }])
+  })
+
+  it('月初的格子关联跨月周，选择器和暂存保持同步', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await click(dutyRowTds(wrapper, 0)[dayCol(2)])
+    await click(btnByText('值班电话'))
+    await click(btnByText('确定'))
+    expect(dutySelects(wrapper)[0].props('modelValue')).toBe(1)
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][1].dutyPhones).toEqual([{ weekStart: '2026-09-28', staffId: 1 }])
+  })
+
+  it('什么都不改仍暂存一格，不暂存值班电话', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await click(dutyRowTds(wrapper, 0)[dayCol(8)])
+    await click(btnByText('确定'))
+    expect(btnByText('暂存（1）')).toBeTruthy()
+    await click(btnByText('暂存（1）'))
+    expect(saveDraft.mock.calls[0][1].entries).toHaveLength(1)
+    expect(saveDraft.mock.calls[0][1].dutyPhones).toEqual([])
+  })
+
+  it('弹窗提示本格值班电话按整周安排', async () => {
+    const { wrapper } = await mountDuty({ ym: '2026-10' })
+    await click(dutyRowTds(wrapper, 0)[dayCol(8)])
+    expect(wrapper.text()).toContain('值班电话按周安排：10/5–10/11 整周')
+  })
+})

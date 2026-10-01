@@ -147,7 +147,16 @@
         {{ s.name }}
       </button>
       <button type="button" class="opt plain" :class="{ on: pick === DEFAULT_PICK }" @click="pick = DEFAULT_PICK">恢复规则默认</button>
+      <button
+        v-if="editWeek"
+        type="button"
+        class="opt duty-opt"
+        :class="{ on: dutyPick }"
+        :style="dutyPick ? { background: data?.dutyPhoneColor } : null"
+        @click="dutyPick = !dutyPick"
+      >值班电话</button>
     </div>
+    <div v-if="editWeek" class="duty-tip">值班电话按周安排：{{ editWeek.label }} 整周</div>
     <el-input
       v-model="remark"
       class="remark"
@@ -616,6 +625,14 @@ const editDate = ref('')
 const editYm = ref('')
 const pick = ref(DEFAULT_PICK)
 const remark = ref('')
+// 弹窗这一格所在的周，找不到为 null
+const editWeek = computed(() =>
+  weeks.value.find((w) => w.weekStart <= editDate.value && editDate.value <= w.weekEnd) || null
+)
+const dutyPick = ref(false)
+const openDuty = ref(false)
+const openPick = ref(DEFAULT_PICK)
+const openRemark = ref('')
 
 const editorTitle = computed(() => {
   const day = days.value.find((d) => d.date === editDate.value)
@@ -633,6 +650,11 @@ const openEditor = (row, date) => {
   // 没排过班（整月还没生成过）时没有当前值，落在「恢复规则默认」上
   pick.value = cell?.shiftCode ?? DEFAULT_PICK
   remark.value = cell?.remark || ''
+  openPick.value = pick.value
+  openRemark.value = remark.value
+  const week = weeks.value.find((w) => w.weekStart <= date && date <= w.weekEnd)
+  openDuty.value = !!week && dutyByWeek.value[week.weekStart] === row.staffId
+  dutyPick.value = openDuty.value
   editorVisible.value = true
 }
 
@@ -649,14 +671,27 @@ const confirmPick = () => {
   }
   // 待暂存的永远只属于一个月；月份变了就是上一批该整批作废（切月本应先清掉，这里是兜底）
   if (pendingYm.value && pendingYm.value !== editYm.value) clearPending()
-  pendingCells.value = {
-    ...pendingCells.value,
-    [cellKey(staffId, workDate)]: {
-      staffId,
-      workDate,
-      shiftCode: pick.value === DEFAULT_PICK ? null : pick.value,
-      remark: remark.value.trim() || null
+  const dutyChanged = !!editWeek.value && dutyPick.value !== openDuty.value
+  const cellChanged = pick.value !== openPick.value || remark.value.trim() !== openRemark.value.trim()
+  // 只动了值班电话开关：不写这一格，免得没改班次的格子也变成“手工修改”
+  if (!dutyChanged || cellChanged) {
+    pendingCells.value = {
+      ...pendingCells.value,
+      [cellKey(staffId, workDate)]: {
+        staffId,
+        workDate,
+        shiftCode: pick.value === DEFAULT_PICK ? null : pick.value,
+        remark: remark.value.trim() || null
+      }
     }
+  }
+  if (dutyChanged) {
+    const weekStart = editWeek.value.weekStart
+    const prev = dutyByWeek.value[weekStart]
+    if (dutyPick.value && prev !== undefined && prev !== null && prev !== staffId) {
+      ElMessage.info(`已替换原值班电话负责人 ${dutyName(weekStart)}`)
+    }
+    pendingDuty.value = { ...pendingDuty.value, [weekStart]: dutyPick.value ? staffId : null }
   }
   pendingYm.value = editYm.value
   editorVisible.value = false
@@ -818,6 +853,8 @@ table.grid td.pending { outline: 2px dashed #f59e0b; outline-offset: -2px; }
   padding: 8px 4px;
 }
 .opt.plain { background: #fff; border: 1px dashed #9ca3af; color: #374151; font-weight: 400; }
+.opt.duty-opt { background: #fff; border: 1px solid #d1d5db; color: #111827; }
 .opt.on { box-shadow: 0 0 0 2px #fff, 0 0 0 4px #111827; }
+.duty-tip { margin-top: 8px; color: #6b7280; font-size: 12px; }
 .remark { margin-top: 14px; }
 </style>
