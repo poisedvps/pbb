@@ -183,6 +183,7 @@ for 每个 schedulable 且 active 的人员 s:
 | M4 | 暂存草稿、排班周期模板、值班电话及其统计（设计见 §8，任务单见 `docs/design/tasks/M4.md`） |
 | M5 | 删除人员（同步清理）、人员批量导入导出、排班表隐藏工号 / 暂存常驻 / 拖动排序（设计见 §9，任务单见 `docs/design/tasks/M5.md`） |
 | M6 | 格子弹窗设置值班电话、值班电话统计改为按周（设计见 §10，任务单见 `docs/design/tasks/M6.md`） |
+| M7 | 新增班次“假日值班”、大屏一屏铺满（设计见 §11，任务单见 `docs/design/tasks/M7.md`） |
 
 ## 8. M4 增量：暂存草稿、排班周期、值班电话（v1.1）
 
@@ -467,3 +468,57 @@ rows = dutyPublishedRepo.findByWeekStartBetweenOrderByWeekStartAsc(from - 3 天,
 ### 10.5 安全
 
 - 无新增接口与写操作；弹窗开关只在 `cellEditable`（科长、可编辑）时出现，后端暂存接口的 ADMIN 校验不变。
+
+## 11. M7 增量：新增班次“假日值班”、大屏一屏铺满（v1.4）
+
+### 11.1 需求确认记录（需求方 2026-10-01，SWO-84 评论）
+
+| # | 需求 | 确认结论 |
+|---|---|---|
+| 1 | 假日值班 | 新增“假日值班”，**按天**安排、按天统计，与**按周**的“值班电话”是两回事。同一周内两者可以并存，同一人既有值班电话又有假日值班也可以 |
+| 2 | 值班电话 | 保持按周（§8、§10 不变） |
+| 3 | 大屏全屏 | 大屏页加【全屏】按钮（浏览器全屏 API，按 Esc 或再点一次退出）；浏览器不允许打开页面就自动全屏 |
+| 4 | 大屏布局 | 去掉顶部 5 张卡片；不分页、不滚动，一屏显示全部人员 × 整月；行高、列宽、字号按实际人数和屏幕尺寸自动计算，铺满不留空 |
+| 5 | 目标屏幕 | 1920×1080，科室 10～20 人排班 |
+
+### 11.2 设计决定
+
+- **“假日值班”做成一个新班次**（代号 `H`），不另建表。理由：它按天、每格一个值，正好是班次的语义。弹窗、周期模板、统计列、导出、调班、大屏都会自动支持，不用写新代码；值班电话是格子底色，与班次天然可以并存。
+- 默认值：`08:00–17:30`、工时 8.0、计工时、颜色 `#0f766e`、排序 7。以上都可以在“班次设置”页修改。不限制只能排在节假日。
+- 统计报表会自动多出一列“假日值班”（天数），“节假日/周末上班”也会计入它。
+- 大屏格子只有约 55px 宽，所以班次名超过 2 个字时只显示前 2 个字（“假日值班”显示为“假日”）。底部图例列出每个班次的颜色和全名。
+
+### 11.3 数据表（Flyway `V3__holiday_duty_shift.sql`）
+
+```sql
+-- M7：新增班次“假日值班”，按天排，与按周的值班电话并存
+INSERT INTO shift_type (code, name, start_time, end_time, cross_day, work_hours, counts_as_work, color, sort_order)
+VALUES ('H', '假日值班', '08:00', '17:30', FALSE, 8.0, TRUE, '#0f766e', 7);
+```
+
+部署后 `/api/health` 返回 `schemaVersion=3`、`shiftTypes=7`。
+
+### 11.4 大屏布局（`frontend/src/utils/screenLayout.js`，纯函数）
+
+输入：表格区域的宽 `width`、高 `height`（像素，取自 `.grid-wrap` 的 `clientWidth` / `clientHeight`），人数 `rows`，天数 `days`。
+
+```
+n = max(1, rows)，d = max(1, days)
+colW  = floor((width − round(width × 0.07)) / d)      // 日期列宽
+nameW = width − colW × d                               // 姓名列吃掉除不尽的余数，横向不留空
+rowH  = max(20, floor((height − max(40, round(height × 0.07))) / n))
+headH = max(40, height − rowH × n)                     // 表头吃掉余数，纵向不留空
+cellFont = clamp(min(rowH × 0.5, (colW − 8) / 2.1), 12, 40)   // 2 个字放得下
+nameFont = clamp(min(rowH × 0.45, (nameW − 16) / 4), 12, 36)  // 4 个字的姓名放得下
+headFont = clamp(min(headH × 0.36, colW × 0.4), 12, 28)
+clamp 的结果取整（Math.round）
+```
+
+1920×1080 下表格区域约 1850×900：10 人时行高 83、格子字 22px、姓名字 32px；20 人时行高 41、格子字 21px、姓名字 18px（原来是 1.5vh≈16px，且需要分页、拖动）。
+
+页面在挂载、窗口 `resize`、`fullscreenchange`、数据刷新后重新计算。结果以 CSS 变量写到表格上，表格 `table-layout: fixed`，宽高等于表格区域，`.grid-wrap` 设 `overflow: hidden`。
+
+### 11.5 安全
+
+- 无新增接口；新增班次走现有 `shift_type`，修改仍只有 ADMIN。
+- 大屏仍只显示姓名，不显示手机号。去掉卡片后，`ScreenVO.today` 前端不再使用，后端不改。
