@@ -12,7 +12,7 @@ import java.util.Map;
  * @param counts        班次代号 → 天数，含全部班次（没有排班的代号为 0），顺序同班次 sort_order
  * @param offDayWork    节假日/周末上班天数：班次计工时且当天是 WEEKEND 或 HOLIDAY，调休上班日不算
  * @param totalHours    总工时：各格对应班次当前的 work_hours 之和
- * @param dutyPhoneDays 值班电话天数：已发布值班电话周的 7 天与统计区间交集的天数之和，与当天班次无关
+ * @param dutyPhoneWeeks 值班电话周数：已发布值班电话周中，周四落在统计区间内的周数（跨月的周算在天数多的月）
  */
 public record StatsRowVO(Long staffId, String empNo, String name, Map<String, Integer> counts,
-                         int offDayWork, BigDecimal totalHours, int dutyPhoneDays) {}
+                         int offDayWork, BigDecimal totalHours, int dutyPhoneWeeks) {}

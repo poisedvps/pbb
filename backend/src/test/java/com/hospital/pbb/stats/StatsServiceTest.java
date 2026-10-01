@@ -36,7 +36,7 @@ import static org.mockito.Mockito.when;
 /**
  * 统计接口（任务单 M3-06、M4-07 验收标准）：Mockito 打桩三个仓库加 {@link ScheduleQueryService}，
  * 重点验 §5.4 的三条口径——各班次天数、节假日/周末上班天数、总工时，成员只看自己，
- * 以及 §8.5 的值班电话天数（按天与统计区间取交集）。
+ * 以及 §8.5 的值班电话周数（周四落在统计区间内）。
  */
 class StatsServiceTest {
 
@@ -125,7 +125,7 @@ class StatsServiceTest {
         return row;
     }
 
-    /** 把 duty_phone_published 换成给定的几周（统计只按 [from-6, to] 查一次，参数由实现自己算） */
+    /** 把 duty_phone_published 换成给定的几周（统计只按 [from-3, to-3] 查一次，参数由实现自己算） */
     private void dutyPhones(DutyPhonePublished... rows) {
         when(dutyPublishedRepo.findByWeekStartBetweenOrderByWeekStartAsc(any(), any())).thenReturn(List.of(rows));
     }
@@ -299,53 +299,53 @@ class StatsServiceTest {
         assertEquals(1, vo.rows().get(0).offDayWork());
     }
 
-    /** M4-07 用例 A：A 值 2026-09-28 那一周（跨月），统计 10-01~10-31 → 只算 10-01~10-04 共 4 天 */
+    /** 用例 A：9-28 那周的周四在 10 月，算 1 周 */
     @Test
-    void dutyPhoneDaysCountsOnlyDaysInsideRange() {
+    void dutyPhoneWeeksCountsWeekWhoseThursdayIsInsideRange() {
         calendarWith();
         dutyPhones(dutyPhone("2026-09-28", 1L));
 
         StatsVO vo = service.stats(FROM, TO, ADMIN);
 
-        assertEquals(4, vo.rows().get(0).dutyPhoneDays());
+        assertEquals(1, vo.rows().get(0).dutyPhoneWeeks());
     }
 
-    /** M4-07 用例 B：A 值 10-05、10-12 两个整周 → 7+7=14 天 */
+    /** 用例 B：10-05、10-12 两周 → 2 周 */
     @Test
-    void dutyPhoneDaysSumsFullWeeks() {
+    void dutyPhoneWeeksSumsFullWeeks() {
         calendarWith();
         dutyPhones(dutyPhone("2026-10-05", 1L), dutyPhone("2026-10-12", 1L));
 
         StatsVO vo = service.stats(FROM, TO, ADMIN);
 
-        assertEquals(14, vo.rows().get(0).dutyPhoneDays());
+        assertEquals(2, vo.rows().get(0).dutyPhoneWeeks());
     }
 
-    /** M4-07 用例 C：A 值 10-26 那一周（尾跨下个月）→ 只算 10-26~10-31 共 6 天 */
+    /** 用例 C：10-26 那周周四在 10 月，算 1 周 */
     @Test
-    void dutyPhoneDaysTruncatesWeekAtRangeEnd() {
+    void dutyPhoneWeeksCountsWeekAtRangeEnd() {
         calendarWith();
         dutyPhones(dutyPhone("2026-10-26", 1L));
 
         StatsVO vo = service.stats(FROM, TO, ADMIN);
 
-        assertEquals(6, vo.rows().get(0).dutyPhoneDays());
+        assertEquals(1, vo.rows().get(0).dutyPhoneWeeks());
     }
 
-    /** M4-07 用例 D：没有值班电话 → 0；值班电话与当天排什么班无关，没排班的人也可以有天数 */
+    /** 用例 D：没有值班电话 → 0 */
     @Test
-    void dutyPhoneDaysIsZeroWhenNobodyIsOnDuty() {
+    void dutyPhoneWeeksIsZeroWhenNobodyIsOnDuty() {
         calendarWith();
-        when(dutyPublishedRepo.findByWeekStartBetweenOrderByWeekStartAsc(any(), any())).thenReturn(List.of());
+        dutyPhones();
 
         StatsVO vo = service.stats(FROM, TO, ADMIN);
 
-        assertEquals(0, vo.rows().get(0).dutyPhoneDays());
+        assertEquals(0, vo.rows().get(0).dutyPhoneWeeks());
     }
 
-    /** M4-07 验收：天数按人归档，没值班的那个人是 0，不是共用同一个人 */
+    /** 周数按人归档，没值班的那个人是 0 */
     @Test
-    void dutyPhoneDaysAreCountedPerStaff() {
+    void dutyPhoneWeeksAreCountedPerStaff() {
         calendarWith();
         when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc())
                 .thenReturn(List.of(staff(1L, "A001", "张三"), staff(2L, "B002", "李四")));
@@ -353,13 +353,13 @@ class StatsServiceTest {
 
         StatsVO vo = service.stats(FROM, TO, ADMIN);
 
-        assertEquals(0, vo.rows().get(0).dutyPhoneDays());
-        assertEquals(7, vo.rows().get(1).dutyPhoneDays());
+        assertEquals(0, vo.rows().get(0).dutyPhoneWeeks());
+        assertEquals(1, vo.rows().get(1).dutyPhoneWeeks());
     }
 
-    /** M4-07 用例 E：成员调用 → 只有本人一行，dutyPhoneDays 照常计算 */
+    /** 成员用例 E：只有本人一行，dutyPhoneWeeks 照常计算 */
     @Test
-    void memberRowStillHasDutyPhoneDays() {
+    void memberRowStillHasDutyPhoneWeeks() {
         calendarWith();
         when(staffRepo.findByActiveTrueOrderBySortOrderAscIdAsc())
                 .thenReturn(List.of(staff(1L, "A001", "张三"), staff(2L, "B002", "李四")));
@@ -369,20 +369,52 @@ class StatsServiceTest {
 
         assertEquals(1, vo.rows().size());
         assertEquals(1L, vo.rows().get(0).staffId());
-        assertEquals(4, vo.rows().get(0).dutyPhoneDays());
+        assertEquals(1, vo.rows().get(0).dutyPhoneWeeks());
     }
 
-    /** M4-07 验收：统计 10-01~10-31 时，仓库按 (2026-09-25, 2026-10-31) 查，才能捐到 9 月那一跨月周 */
+    /** 查询范围：统计 10-01~10-31 时，周一的查询范围为 9-28~10-28 */
     @Test
-    void dutyPhoneQueryStartsSixDaysBeforeRangeStart() {
+    void dutyPhoneQueryCoversWeeksWhoseThursdayIsInRange() {
         calendarWith();
 
         service.stats(FROM, TO, ADMIN);
 
-        verify(dutyPublishedRepo).findByWeekStartBetweenOrderByWeekStartAsc(LocalDate.of(2026, 9, 25), TO);
+        verify(dutyPublishedRepo).findByWeekStartBetweenOrderByWeekStartAsc(
+                LocalDate.of(2026, 9, 28), LocalDate.of(2026, 10, 28));
     }
 
-    /** M3-08 验收：6 个班次 → 表头 2+6+3=11 列；M4-07 验收：倒数第二列是值班电话（天），最后一列是总工时 */
+    /** 用例 G：9-28 那周的周四在 10 月，不算在 9 月 */
+    @Test
+    void dutyPhoneWeeksExcludeNextMonthsWeek() {
+        dutyPhones(dutyPhone("2026-09-28", 1L));
+
+        StatsVO vo = service.stats(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), ADMIN);
+
+        assertEquals(0, vo.rows().get(0).dutyPhoneWeeks());
+    }
+
+    /** 用例 H：8-31 那周的周四在 9 月，算在 9 月 */
+    @Test
+    void dutyPhoneWeeksIncludePreviousMonthsWeek() {
+        dutyPhones(dutyPhone("2026-08-31", 1L));
+
+        StatsVO vo = service.stats(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30), ADMIN);
+
+        assertEquals(1, vo.rows().get(0).dutyPhoneWeeks());
+    }
+
+    /** 用例 I：季度统计等于各月周数之和 */
+    @Test
+    void dutyPhoneWeeksCountAcrossQuarter() {
+        dutyPhones(dutyPhone("2026-09-28", 1L), dutyPhone("2026-10-26", 1L),
+                dutyPhone("2026-12-28", 1L));
+
+        StatsVO vo = service.stats(LocalDate.of(2026, 10, 1), LocalDate.of(2026, 12, 31), ADMIN);
+
+        assertEquals(3, vo.rows().get(0).dutyPhoneWeeks());
+    }
+
+    /** M3-08 验收：6 个班次 → 表头 2+6+3=11 列；M6 验收：倒数第二列是值班电话（周），最后一列是总工时 */
     @Test
     void exportHeadersAreStaffColumnsPlusShiftNamesPlusThreeTotals() {
         List<String> headers = service.exportHeaders();
@@ -390,7 +422,7 @@ class StatsServiceTest {
         assertEquals(11, headers.size());
         // 班次列名用 name（不是代号），顺序同班次 sort_order
         assertEquals(List.of("工号", "姓名", "班次D", "班次N", "班次Z", "班次B", "班次L", "班次X",
-                "节假日/周末上班", "值班电话（天）", "总工时"), headers);
+                "节假日/周末上班", "值班电话（周）", "总工时"), headers);
     }
 
     /** M3-08 验收：每行 11 个值且顺序同表头；残留代号不占列；没排班的人也有一行全 0 */
@@ -417,12 +449,12 @@ class StatsServiceTest {
         assertEquals(List.of("A001", "张三", 1, 1, 0, 0, 0, 0, 1, 0), zhang.subList(0, 10));
         assertEquals(Integer.class, zhang.get(2).getClass());
         assertEquals(Integer.class, zhang.get(8).getClass());
-        // 倒数第二列是值班电话（天），也是 Integer，Excel 里能直接求和
+        // 倒数第二列是值班电话（周），也是 Integer，Excel 里能直接求和
         assertEquals(Integer.class, zhang.get(9).getClass());
         assertEquals(0, ((BigDecimal) zhang.get(10)).compareTo(new BigDecimal("22.5")));
 
         List<Object> li = rows.get(1);
-        assertEquals(List.of("B002", "李四", 0, 0, 0, 0, 0, 0, 0, 7, new BigDecimal("0")), li);
+        assertEquals(List.of("B002", "李四", 0, 0, 0, 0, 0, 0, 0, 1, new BigDecimal("0")), li);
     }
 
     /** 一行数据都没有（成员没关联人员）→ 导出只有表头，行列表为空 */

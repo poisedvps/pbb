@@ -46,8 +46,8 @@
       <el-table-column label="节假日/周末上班" width="140" align="center">
         <template #default="{ row }">{{ row.offDayWork ?? 0 }}</template>
       </el-table-column>
-      <el-table-column label="值班电话（天）" width="120" align="center">
-        <template #default="{ row }">{{ row.dutyPhoneDays ?? 0 }}</template>
+      <el-table-column label="值班电话（周）" width="120" align="center">
+        <template #default="{ row }">{{ row.dutyPhoneWeeks ?? 0 }}</template>
       </el-table-column>
       <el-table-column label="总工时" width="100" align="center">
         <template #default="{ row }">{{ row.totalHours ?? 0 }}</template>
@@ -161,7 +161,7 @@ const rows = computed(() => data.value?.rows || [])
 
 const sum = (pick) => rows.value.reduce((acc, row) => acc + (Number(pick(row)) || 0), 0)
 
-// 合计行按列序拼：姓名 + 各班次（顺序同 listShiftTypes）+ 节假日/周末上班 + 值班电话（天）+ 总工时。
+// 合计行按列序拼：姓名 + 各班次（顺序同 listShiftTypes）+ 节假日/周末上班 + 值班电话（周）+ 总工时。
 // 列数和「班次列数 + 4」对不上说明表格渲染的列和 shifts 不是同一份，宁可不给合计也不串列。
 const summary = ({ columns }) => {
   const cells = new Array(columns.length).fill('')
@@ -171,7 +171,7 @@ const summary = ({ columns }) => {
     cells[i + 1] = sum((row) => row.counts?.[s.code])
   })
   cells[shifts.value.length + 1] = sum((row) => row.offDayWork)
-  cells[shifts.value.length + 2] = sum((row) => row.dutyPhoneDays)
+  cells[shifts.value.length + 2] = sum((row) => row.dutyPhoneWeeks)
   cells[shifts.value.length + 3] = sum((row) => row.totalHours).toFixed(1)
   return cells
 }
