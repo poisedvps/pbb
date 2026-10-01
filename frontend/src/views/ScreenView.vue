@@ -1,6 +1,9 @@
 <template>
   <div class="screen">
-    <button class="exit" @click="onExit">退出</button>
+    <div class="btns">
+      <button class="tool" @click="toggleFullscreen">{{ isFull ? '退出全屏' : '全屏' }}</button>
+      <button class="tool" @click="onExit">退出</button>
+    </div>
 
     <div class="head">
       <div class="head-left">
@@ -13,34 +16,15 @@
       </div>
     </div>
 
-    <div class="cards">
-      <div class="card">
-        <div class="card-label">今日白班在岗</div>
-        <div class="card-value">{{ today ? today.dayCount + ' 人' : '—' }}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">今晚夜班</div>
-        <div class="card-value names">{{ names(today?.night) }}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">今日值班</div>
-        <div class="card-value names">{{ names(today?.duty) }}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">今日请假</div>
-        <div class="card-value names">{{ names(today?.leave) }}</div>
-      </div>
-      <!-- 第五张卡片只出姓名，手机号一律不上大屏（设计 §8.6） -->
-      <div class="card">
-        <div class="card-label">本周值班电话</div>
-        <div class="card-value names">{{ weekDutyName }}</div>
-      </div>
-    </div>
-
-    <div class="grid-wrap">
+    <div ref="gridWrap" class="grid-wrap">
       <div v-if="!data" class="tip">等待数据…</div>
       <div v-else-if="!published" class="tip">本月排班尚未发布</div>
-      <table v-else class="grid">
+      <table v-else class="grid" :style="gridStyle" :data-row-h="layout.rowH"
+             :data-cell-font="layout.cellFont" :data-name-font="layout.nameFont">
+        <colgroup>
+          <col :style="{ width: layout.nameW + 'px' }" />
+          <col v-for="day in days" :key="day.date" :style="{ width: layout.colW + 'px' }" />
+        </colgroup>
         <thead>
           <tr>
             <th class="name">姓名</th>
@@ -51,7 +35,7 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="row in pageRows" :key="row.staffId">
+          <tr v-for="row in rows" :key="row.staffId">
             <td class="name">{{ row.name }}</td>
             <td v-for="day in days" :key="day.date" :class="{ now: day.date === todayDate }"
                 :style="isDutyCell(row.staffId, day.date) ? { background: month.dutyPhoneColor } : null">
@@ -63,7 +47,7 @@
     </div>
 
     <div class="foot">
-      <span v-if="paged" class="page">第 {{ page }}/{{ totalPages }} 页 · 每 15 秒自动翻页</span>
+      <span v-for="s in legendShifts" :key="s.code" class="legend"><i class="swatch" :style="{ background: s.color }"></i>{{ s.name }}</span>
       <span class="legend"><i class="swatch" :style="{ background: month?.dutyPhoneColor }"></i>值班电话</span>
       <span class="sp"></span>
       <span>数据每 5 分钟自动刷新 · 仅显示已发布排班</span>
@@ -72,11 +56,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { getScreen } from '../api/screen'
 import { listShiftTypes } from '../api/shifts'
 import { useAuthStore } from '../stores/auth'
+import { screenLayout } from '../utils/screenLayout'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -87,11 +72,38 @@ const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate(
 const now = ref(new Date())
 const data = ref(null)
 const shifts = ref([])
-const page = ref(1)
-const rowsPerPage = ref(10)
+const gridWrap = ref(null)
+const box = ref({ width: 0, height: 0 })
+const isFull = ref(false)
+const layout = computed(() =>
+  screenLayout({ width: box.value.width, height: box.value.height, rows: rows.value.length, days: days.value.length })
+)
+const gridStyle = computed(() => ({
+  width: `${box.value.width}px`,
+  height: `${box.value.height}px`,
+  '--head-h': `${layout.value.headH}px`,
+  '--row-h': `${layout.value.rowH}px`,
+  '--cell-font': `${layout.value.cellFont}px`,
+  '--name-font': `${layout.value.nameFont}px`,
+  '--head-font': `${layout.value.headFont}px`
+}))
+const legendShifts = computed(() => shifts.value.filter((s) => s.enabled))
+
+const measure = () => {
+  if (gridWrap.value) box.value = { width: gridWrap.value.clientWidth, height: gridWrap.value.clientHeight }
+  isFull.value = !!document.fullscreenElement
+}
+const onFullscreenChange = async () => { await nextTick(); measure() }
+const toggleFullscreen = async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen()
+    else await document.documentElement.requestFullscreen()
+  } catch {
+    // 浏览器拒绝（如未由点击触发）时保持原样
+  }
+}
 
 let clockTimer
-let pageTimer
 let refreshTimer
 
 // 大屏只展示当月，跨月后下一次刷新自动换到新月份
@@ -99,8 +111,8 @@ const load = async () => {
   const d = new Date()
   try {
     data.value = await getScreen(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`)
-    // 刷新后人员可能减少、页数变少，不校正页码就会停在范围外的空页上，表格一直空白
-    if (page.value > totalPages.value) page.value = 1
+    await nextTick()
+    measure()
   } catch {
     // 失败提示由 http 拦截器统一弹出（含 403「无权限」），这里只保留上一次画面，不让页面崩
   }
@@ -109,21 +121,10 @@ const load = async () => {
 // 表头时钟每 30 秒走一次，大屏挂在那里没人盯着，分钟级足够
 const tick = () => {
   now.value = new Date()
-  updateRowsPerPage()
-}
-
-// 一行 40px，表格区约占 62% 视口高，按窗口高度算出每页行数
-const updateRowsPerPage = () => {
-  rowsPerPage.value = Math.max(5, Math.floor((window.innerHeight * 0.62) / 40))
-  if (page.value > totalPages.value) page.value = 1
-}
-
-const nextPage = () => {
-  if (totalPages.value > 1) page.value = (page.value % totalPages.value) + 1
 }
 
 onMounted(() => {
-  updateRowsPerPage()
+  measure()
   load()
   listShiftTypes()
     .then((r) => {
@@ -131,20 +132,19 @@ onMounted(() => {
     })
     .catch(() => {}) // 班次取不到只影响色块配色，表格照常显示
   clockTimer = setInterval(tick, 30000)
-  pageTimer = setInterval(nextPage, 15000)
   refreshTimer = setInterval(load, 5 * 60000)
-  window.addEventListener('resize', updateRowsPerPage)
+  window.addEventListener('resize', measure)
+  document.addEventListener('fullscreenchange', onFullscreenChange)
 })
 
 onUnmounted(() => {
   clearInterval(clockTimer)
-  clearInterval(pageTimer)
   clearInterval(refreshTimer)
-  window.removeEventListener('resize', updateRowsPerPage)
+  window.removeEventListener('resize', measure)
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
 })
 
 const month = computed(() => data.value?.month || null)
-const today = computed(() => data.value?.today || null)
 const days = computed(() => month.value?.days || [])
 const rows = computed(() => month.value?.rows || [])
 const todayDate = computed(() => ymd(now.value))
@@ -166,13 +166,6 @@ const versionText = computed(() => (month.value?.version > 0 ? `已发布 v${mon
 // 所有行都没格子才算未发布，个别人员没排班不算
 const published = computed(() => rows.value.some((r) => Object.keys(r.cells || {}).length > 0))
 
-const totalPages = computed(() => Math.max(1, Math.ceil(rows.value.length / rowsPerPage.value)))
-const paged = computed(() => rows.value.length > rowsPerPage.value)
-const pageRows = computed(() => {
-  const start = (page.value - 1) * rowsPerPage.value
-  return rows.value.slice(start, start + rowsPerPage.value)
-})
-
 const shiftByCode = computed(() => Object.fromEntries(shifts.value.map((s) => [s.code, s])))
 const cellOf = (row, date) => row.cells?.[date] || null
 
@@ -183,21 +176,18 @@ const dutyPhones = computed(() => month.value?.dutyPhones || [])
 const isDutyCell = (staffId, date) =>
   dutyPhones.value.some((d) => d.weekStart <= date && date <= d.weekEnd && d.staffId === staffId)
 
-// 本周谁在值值班电话：本周没有已发布的记录（或人员已删、name 为空串）时显示“—”
-const weekDutyName = computed(
-  () => dutyPhones.value.find((d) => d.weekStart <= todayDate.value && todayDate.value <= d.weekEnd)?.name || '—',
-)
-
 // 班次被停用后快照里仍带着它的 code，取不到就退成灰底代号，不留白格
 const chipStyle = (row, date) => ({ background: shiftByCode.value[cellOf(row, date).shiftCode]?.color || '#9ca3af' })
-const chipText = (row, date) => shiftByCode.value[cellOf(row, date).shiftCode]?.name || cellOf(row, date).shiftCode
+const chipText = (row, date) => {
+  const code = cellOf(row, date).shiftCode
+  const name = shiftByCode.value[code]?.name || code
+  return name.length > 2 ? name.slice(0, 2) : name
+}
 
 const dayNo = (date) => Number(date.slice(8, 10))
 const WD = ['一', '二', '三', '四', '五', '六', '日']
 const weekLabel = (day) => WD[(day.weekday || 1) - 1]
 const isOff = (day) => day.kind === 'WEEKEND' || day.kind === 'HOLIDAY'
-
-const names = (list) => (list?.length ? list.join('、') : '—')
 
 // 大屏账号退出要清登录态回登录页；科长是开新标签页过来的，直接关掉
 const onExit = async () => {
@@ -222,11 +212,8 @@ const onExit = async () => {
   overflow: hidden;
 }
 
-.exit {
-  position: fixed;
-  top: 2vh;
-  right: 1.8vw;
-  z-index: 3;
+.btns { position: fixed; top: 2vh; right: 1.8vw; z-index: 3; display: flex; gap: 0.6vw; }
+.tool {
   border: 1px solid rgba(229, 231, 235, 0.3);
   background: rgba(229, 231, 235, 0.12);
   color: #e5e7eb;
@@ -235,7 +222,7 @@ const onExit = async () => {
   font-size: 1.5vh;
   cursor: pointer;
 }
-.exit:hover {
+.tool:hover {
   background: rgba(229, 231, 235, 0.24);
 }
 
@@ -246,51 +233,22 @@ const onExit = async () => {
 .clock { font-size: 5.4vh; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; color: #fff; }
 .today { font-size: 1.9vh; color: #94a3b8; margin-top: 0.4vh; }
 
-.cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1.2vw; margin: 2.2vh 0; }
-.card { background: #111c33; border: 1px solid #1e293b; border-radius: 8px; padding: 1.4vh 1vw; min-height: 9vh; overflow: hidden; }
-.card-label { font-size: 1.7vh; color: #94a3b8; }
-.card-value { font-size: 2.6vh; font-weight: 700; color: #fff; margin-top: 0.8vh; line-height: 1.3; }
-.card-value.names { font-size: 2vh; font-weight: 500; }
-
-.grid-wrap { flex: 1; overflow: auto; border: 1px solid #1e293b; border-radius: 8px; }
+.grid-wrap { flex: 1; min-height: 0; margin-top: 1.6vh; overflow: hidden; border: 1px solid #1e293b; border-radius: 8px; }
 .tip { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 3vh; color: #64748b; }
 
-table.grid { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; }
-table.grid th, table.grid td {
-  border-right: 1px solid #1e293b;
-  border-bottom: 1px solid #1e293b;
-  text-align: center;
-  padding: 0;
-  height: 40px;
-}
-table.grid thead th { background: #111c33; color: #cbd5e1; min-width: 3.4vw; padding: 0.4vh 0; font-weight: 500; line-height: 1.2; font-size: 1.9vh; }
-table.grid thead th small { display: block; color: #64748b; font-size: 1.5vh; }
+table.grid { border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+table.grid th, table.grid td { padding: 0; text-align: center; border: 0; box-shadow: inset -1px -1px 0 #1e293b; overflow: hidden; }
+table.grid thead tr { height: var(--head-h); }
+table.grid tbody tr { height: var(--row-h); }
+table.grid thead th { background: #111c33; color: #cbd5e1; font-weight: 500; line-height: 1.2; font-size: var(--head-font); }
+table.grid thead th small { display: block; color: #64748b; font-size: calc(var(--head-font) * 0.7); }
 table.grid thead th.we { background: #0e1729; color: #64748b; }
 /* 今天所在整列高亮，表头一起亮，大屏上一眼能看到今天 */
 table.grid th.now, table.grid td.now { background: #1e3a8a; }
-table.grid .name {
-  position: sticky;
-  left: 0;
-  z-index: 1;
-  background: #0b1220;
-  text-align: left;
-  padding: 0 0.8vw;
-  min-width: 7vw;
-  white-space: nowrap;
-  font-size: 1.9vh;
-}
-table.grid thead th.name { z-index: 2; background: #111c33; }
-table.grid td { min-width: 3.4vw; }
+table.grid .name { text-align: left; padding: 0 0.6vw; white-space: nowrap; text-overflow: ellipsis; font-size: var(--name-font); background: #0b1220; }
+table.grid thead th.name { background: #111c33; }
 
-.chip {
-  display: inline-block;
-  min-width: 2.4vw;
-  padding: 0.3vh 0.2vw;
-  border-radius: 4px;
-  color: #fff;
-  font-size: 1.5vh;
-  font-weight: 600;
-}
+.chip { display: flex; align-items: center; justify-content: center; height: calc(var(--row-h) - 8px); margin: 0 3px; border-radius: 4px; color: #fff; font-size: var(--cell-font); font-weight: 700; white-space: nowrap; }
 
 .foot {
   position: fixed;
@@ -304,7 +262,6 @@ table.grid td { min-width: 3.4vw; }
   color: #94a3b8;
 }
 .foot .sp { flex: 1; }
-.foot .page { color: #93c5fd; }
 .foot .legend { display: inline-flex; align-items: center; gap: 6px; }
 .foot .swatch { display: inline-block; width: 1.6vh; height: 1.6vh; border-radius: 3px; border: 1px solid rgba(229, 231, 235, 0.3); }
 </style>
